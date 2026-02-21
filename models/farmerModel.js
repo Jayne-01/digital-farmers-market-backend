@@ -1,26 +1,24 @@
 const db = require('../config/database');
 
 class Farmer {
-    // CREATE a new farmer profile 
+    // CREATE a new farmer profile
     static async create(user_id, farmerData) {
-        const { farm_name, barangay, farm_description, product_categories } = farmerData;
+        const { farm_name, barangay, farm_description } = farmerData;
         const query = `
             INSERT INTO farmers (
                 user_id, 
                 farm_name, 
                 barangay, 
-                farm_description, 
-                product_categories
+                farm_description
             )
-            VALUES ($1, $2, $3, $4, $5)
+            VALUES ($1, $2, $3, $4)
             RETURNING *
         `;
         return await db.query(query, [
             user_id, 
             farm_name, 
             barangay, 
-            farm_description || null, 
-            product_categories || null
+            farm_description || null
         ]);
     }
 
@@ -33,14 +31,14 @@ class Farmer {
                 f.farm_name,
                 f.barangay,
                 f.farm_description,
-                f.product_categories,
                 f.verified_status,
                 f.created_at,
                 f.updated_at,
                 u.full_name, 
                 u.email, 
                 u.contact_number, 
-                u.address
+                u.address,
+                u.barangay as user_barangay
             FROM farmers f
             JOIN users u ON f.user_id = u.user_id
             WHERE f.user_id = $1 AND u.status = 'ACTIVE'
@@ -48,7 +46,7 @@ class Farmer {
         return await db.query(query, [user_id]);
     }
 
-    // GET all farmers
+    // GET all farmers 
     static async getAllFarmers() {
         const query = `
             SELECT 
@@ -57,28 +55,28 @@ class Farmer {
                 f.farm_name,
                 f.barangay,
                 f.farm_description,
-                f.product_categories,
                 f.verified_status,
                 f.created_at,
                 u.full_name, 
                 u.email, 
                 u.contact_number, 
-                u.address
+                u.address,
+                u.barangay as user_barangay
             FROM farmers f
             JOIN users u ON f.user_id = u.user_id
             WHERE u.status = 'ACTIVE'
+            ORDER BY f.created_at DESC
         `;
         return await db.query(query);
     }
 
     // UPDATE farmer profile 
     static async updateFarmerProfile(farmer_id, updateData) {
-        // Build dynamic update query
+        // Build dynamic update query with allowed fields
         const allowedFields = [
             'farm_name', 
             'barangay', 
             'farm_description', 
-            'product_categories', 
             'verified_status'
         ];
         
@@ -105,7 +103,7 @@ class Farmer {
         return await db.query(query, [farmer_id, ...values]);
     }
 
-    // GET farmer statistics
+    // GET farmer statistics 
     static async getFarmerStats(farmer_id) {
         const query = `
             SELECT 
@@ -113,10 +111,10 @@ class Farmer {
                 f.farm_name,
                 COUNT(DISTINCT p.product_id) as total_products,
                 COUNT(DISTINCT o.order_id) as total_orders,
-                COALESCE(SUM(o.total_amount), 0) as total_sales
+                COALESCE(SUM(CASE WHEN o.order_status = 'DELIVERED' THEN o.total_amount ELSE 0 END), 0) as total_sales
             FROM farmers f
             LEFT JOIN products p ON f.farmer_id = p.farmer_id
-            LEFT JOIN orders o ON f.farmer_id = o.farmer_id AND o.order_status = 'DELIVERED'
+            LEFT JOIN orders o ON f.farmer_id = o.farmer_id
             WHERE f.farmer_id = $1
             GROUP BY f.farmer_id, f.farm_name
         `;
@@ -126,11 +124,45 @@ class Farmer {
     // GET unavailable products
     static async getUnavailableProducts(farmer_id) {
         const query = `
-            SELECT * FROM products 
+            SELECT 
+                product_id,
+                product_name,
+                category,
+                status,
+                updated_at
+            FROM products 
             WHERE farmer_id = $1 
             AND status = 'UNAVAILABLE'
             ORDER BY updated_at DESC
             LIMIT 5
+        `;
+        return await db.query(query, [farmer_id]);
+    }
+
+    // VERIFY farmer (admin function)
+    static async verifyFarmer(farmer_id) {
+        const query = `
+            UPDATE farmers 
+            SET verified_status = true, updated_at = NOW() 
+            WHERE farmer_id = $1 
+            RETURNING *
+        `;
+        return await db.query(query, [farmer_id]);
+    }
+
+    // GET farmer by ID (for admin)
+    static async findById(farmer_id) {
+        const query = `
+            SELECT 
+                f.*,
+                u.full_name,
+                u.email,
+                u.contact_number,
+                u.address,
+                u.barangay as user_barangay
+            FROM farmers f
+            JOIN users u ON f.user_id = u.user_id
+            WHERE f.farmer_id = $1
         `;
         return await db.query(query, [farmer_id]);
     }
