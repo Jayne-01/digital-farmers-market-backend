@@ -39,7 +39,7 @@ const getCustomerOrders = async (req, res) => {
                 o.order_date,
                 f.farm_name,
                 (
-                    SELECT COALESCE(json_agg(
+                    SELECT json_agg(
                         json_build_object(
                             'order_item_id', oi.order_item_id,
                             'product_id', oi.product_id,
@@ -48,7 +48,7 @@ const getCustomerOrders = async (req, res) => {
                             'price', oi.price,
                             'image_url', p.image_url
                         )
-                    ), '[]'::json)
+                    )
                     FROM order_items oi
                     JOIN products p ON oi.product_id = p.product_id
                     WHERE oi.order_id = o.order_id
@@ -64,7 +64,8 @@ const getCustomerOrders = async (req, res) => {
         // Transform the data for frontend
         const orders = result.rows.map(order => ({
             ...order,
-            delivery_address: order.address
+            delivery_address: order.address,
+            items: order.items || [] // Ensure items is always an array
         }));
         
         res.json({
@@ -100,8 +101,8 @@ const getFarmerOrders = async (req, res) => {
         const farmer_id = farmerResult.rows[0].farmer_id;
         console.log('Farmer ID:', farmer_id);
 
-        // FIXED: Get orders that contain this farmer's products only
-        const query = `
+        // SIMPLIFIED QUERY - First get all orders that contain this farmer's products
+        const ordersQuery = `
             SELECT DISTINCT 
                 o.order_id,
                 o.customer_id,
@@ -115,22 +116,7 @@ const getFarmerOrders = async (req, res) => {
                 o.order_date,
                 u.full_name as customer_name,
                 u.email as customer_email,
-                u.contact_number as customer_contact,
-                (
-                    SELECT COALESCE(json_agg(
-                        json_build_object(
-                            'order_item_id', oi.order_item_id,
-                            'product_id', oi.product_id,
-                            'product_name', p.product_name,
-                            'quantity', oi.quantity,
-                            'price', oi.price,
-                            'image_url', p.image_url
-                        )
-                    ), '[]'::json)
-                    FROM order_items oi
-                    JOIN products p ON oi.product_id = p.product_id
-                    WHERE oi.order_id = o.order_id AND p.farmer_id = $1
-                ) as items
+                u.contact_number as customer_contact
             FROM orders o
             JOIN users u ON o.customer_id = u.user_id
             WHERE EXISTS (
@@ -142,15 +128,33 @@ const getFarmerOrders = async (req, res) => {
             ORDER BY o.order_date DESC
         `;
 
-        console.log('Executing query...');
-        const result = await db.query(query, [farmer_id]);
+        console.log('Executing orders query...');
+        const ordersResult = await db.query(ordersQuery, [farmer_id]);
         
-        console.log(`Found ${result.rows.length} orders for farmer ${farmer_id}`);
+        console.log(`Found ${ordersResult.rows.length} orders for farmer ${farmer_id}`);
         
-        // Filter out orders with empty items and transform
-        const orders = result.rows
-            .filter(order => order.items && order.items.length > 0)
-            .map(order => ({
+        // For each order, get only the items belonging to this farmer
+        const orders = [];
+        
+        for (const order of ordersResult.rows) {
+            const itemsQuery = `
+                SELECT 
+                    oi.order_item_id,
+                    oi.order_id,
+                    oi.product_id,
+                    oi.quantity,
+                    oi.price,
+                    p.product_name,
+                    p.image_url,
+                    p.category
+                FROM order_items oi
+                JOIN products p ON oi.product_id = p.product_id
+                WHERE oi.order_id = $1 AND p.farmer_id = $2
+            `;
+            
+            const itemsResult = await db.query(itemsQuery, [order.order_id, farmer_id]);
+            
+            orders.push({
                 order_id: order.order_id,
                 customer_id: order.customer_id,
                 farmer_id: order.farmer_id,
@@ -165,8 +169,9 @@ const getFarmerOrders = async (req, res) => {
                 customer_name: order.customer_name,
                 customer_email: order.customer_email,
                 customer_contact: order.customer_contact,
-                items: order.items || []
-            }));
+                items: itemsResult.rows || []
+            });
+        }
         
         res.json({
             success: true,
@@ -193,7 +198,6 @@ const getOrderById = async (req, res) => {
         let values;
         
         if (req.user.role === 'FARMER') {
-            // Farmers can only view orders that contain their products
             const farmerResult = await Farmer.findByUserId(req.user.user_id);
             if (farmerResult.rows.length === 0) {
                 return res.status(403).json({ 
@@ -203,6 +207,7 @@ const getOrderById = async (req, res) => {
             }
             const farmer_id = farmerResult.rows[0].farmer_id;
             
+            // Get order if it contains farmer's products
             query = `
                 SELECT 
                     o.order_id,
@@ -218,22 +223,7 @@ const getOrderById = async (req, res) => {
                     u.full_name as customer_name,
                     u.email as customer_email,
                     u.contact_number as customer_contact,
-                    f.farm_name,
-                    (
-                        SELECT COALESCE(json_agg(
-                            json_build_object(
-                                'order_item_id', oi.order_item_id,
-                                'product_id', oi.product_id,
-                                'product_name', p.product_name,
-                                'quantity', oi.quantity,
-                                'price', oi.price,
-                                'image_url', p.image_url
-                            )
-                        ), '[]'::json)
-                        FROM order_items oi
-                        JOIN products p ON oi.product_id = p.product_id
-                        WHERE oi.order_id = o.order_id AND p.farmer_id = $2
-                    ) as items
+                    f.farm_name
                 FROM orders o
                 JOIN users u ON o.customer_id = u.user_id
                 LEFT JOIN farmers f ON o.farmer_id = f.farmer_id
@@ -246,7 +236,6 @@ const getOrderById = async (req, res) => {
             `;
             values = [id, farmer_id];
         } else {
-            // Customers can only view their own orders
             query = `
                 SELECT 
                     o.order_id,
@@ -262,22 +251,7 @@ const getOrderById = async (req, res) => {
                     u.full_name as customer_name,
                     u.email as customer_email,
                     u.contact_number as customer_contact,
-                    f.farm_name,
-                    (
-                        SELECT COALESCE(json_agg(
-                            json_build_object(
-                                'order_item_id', oi.order_item_id,
-                                'product_id', oi.product_id,
-                                'product_name', p.product_name,
-                                'quantity', oi.quantity,
-                                'price', oi.price,
-                                'image_url', p.image_url
-                            )
-                        ), '[]'::json)
-                        FROM order_items oi
-                        JOIN products p ON oi.product_id = p.product_id
-                        WHERE oi.order_id = o.order_id
-                    ) as items
+                    f.farm_name
                 FROM orders o
                 JOIN users u ON o.customer_id = u.user_id
                 LEFT JOIN farmers f ON o.farmer_id = f.farmer_id
@@ -295,12 +269,55 @@ const getOrderById = async (req, res) => {
             });
         }
 
+        // Get items for this order
+        let itemsQuery;
+        let itemsValues;
+        
+        if (req.user.role === 'FARMER') {
+            const farmerResult = await Farmer.findByUserId(req.user.user_id);
+            const farmer_id = farmerResult.rows[0].farmer_id;
+            
+            itemsQuery = `
+                SELECT 
+                    oi.order_item_id,
+                    oi.order_id,
+                    oi.product_id,
+                    oi.quantity,
+                    oi.price,
+                    p.product_name,
+                    p.image_url,
+                    p.category
+                FROM order_items oi
+                JOIN products p ON oi.product_id = p.product_id
+                WHERE oi.order_id = $1 AND p.farmer_id = $2
+            `;
+            itemsValues = [id, farmer_id];
+        } else {
+            itemsQuery = `
+                SELECT 
+                    oi.order_item_id,
+                    oi.order_id,
+                    oi.product_id,
+                    oi.quantity,
+                    oi.price,
+                    p.product_name,
+                    p.image_url,
+                    p.category
+                FROM order_items oi
+                JOIN products p ON oi.product_id = p.product_id
+                WHERE oi.order_id = $1
+            `;
+            itemsValues = [id];
+        }
+        
+        const itemsResult = await db.query(itemsQuery, itemsValues);
+
         // Transform the data for frontend
         const order = {
             ...result.rows[0],
             total_amount: parseFloat(result.rows[0].total_amount),
             delivery_address: result.rows[0].address,
-            items: result.rows[0].items || []
+            items: itemsResult.rows || []
         };
 
         res.json({
@@ -323,9 +340,8 @@ const getOrderItems = async (req, res) => {
     try {
         const { id } = req.params;
         
-        // First verify the order belongs to the user or farmer
-        let verifyQuery;
-        let verifyValues;
+        let query;
+        let values;
         
         if (req.user.role === 'FARMER') {
             const farmerResult = await Farmer.findByUserId(req.user.user_id);
@@ -335,40 +351,6 @@ const getOrderItems = async (req, res) => {
                     error: 'User is not a registered farmer' 
                 });
             }
-            const farmer_id = farmerResult.rows[0].farmer_id;
-            
-            // Verify farmer has items in this order
-            verifyQuery = `
-                SELECT o.order_id 
-                FROM orders o
-                WHERE o.order_id = $1 AND EXISTS (
-                    SELECT 1
-                    FROM order_items oi
-                    JOIN products p ON oi.product_id = p.product_id
-                    WHERE oi.order_id = o.order_id AND p.farmer_id = $2
-                )
-            `;
-            verifyValues = [id, farmer_id];
-        } else {
-            verifyQuery = 'SELECT order_id FROM orders WHERE order_id = $1 AND customer_id = $2';
-            verifyValues = [id, req.user.user_id];
-        }
-        
-        const verifyResult = await db.query(verifyQuery, verifyValues);
-        
-        if (verifyResult.rows.length === 0) {
-            return res.status(404).json({ 
-                success: false, 
-                error: 'Order not found or not authorized' 
-            });
-        }
-        
-        // Get order items - for farmers, only show their items
-        let query;
-        let queryValues;
-        
-        if (req.user.role === 'FARMER') {
-            const farmerResult = await Farmer.findByUserId(req.user.user_id);
             const farmer_id = farmerResult.rows[0].farmer_id;
             
             query = `
@@ -386,7 +368,7 @@ const getOrderItems = async (req, res) => {
                 JOIN products p ON oi.product_id = p.product_id
                 WHERE oi.order_id = $1 AND p.farmer_id = $2
             `;
-            queryValues = [id, farmer_id];
+            values = [id, farmer_id];
         } else {
             query = `
                 SELECT 
@@ -403,10 +385,10 @@ const getOrderItems = async (req, res) => {
                 JOIN products p ON oi.product_id = p.product_id
                 WHERE oi.order_id = $1
             `;
-            queryValues = [id];
+            values = [id];
         }
 
-        const result = await db.query(query, queryValues);
+        const result = await db.query(query, values);
         
         res.json({
             success: true,
@@ -470,7 +452,7 @@ const updateOrderStatus = async (req, res) => {
             });
         }
 
-        // Update status - using order_status column
+        // Update status
         const updateQuery = `
             UPDATE orders 
             SET order_status = $1 
