@@ -57,17 +57,17 @@ const getFarmerDashboard = async (req, res) => {
                 barangay: farmer.barangay,
                 product_categories: farmer.product_categories,
                 verified_status: farmer.verified_status || false
-                // REMOVED: farmer_rating
+                
             },
             statistics: statsResult.rows[0] || {
                 total_products: 0,
                 total_orders: 0,
                 total_sales: 0
-                // REMOVED: average_rating
+                
             },
             recent_orders: recentOrders.rows.slice(0, 5),
             unavailable_products: unavailableProducts.rows.slice(0, 5)
-            // REMOVED: recent_feedback
+            
         });
         
     } catch (error) {

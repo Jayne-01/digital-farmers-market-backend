@@ -30,7 +30,7 @@ const register = async (req, res) => {
             });
         }
 
-        // Check if user exists (adjust based on your User model)
+        // Check if user exists 
         const existingUser = await User.findByEmail(email);
         if (existingUser && existingUser.rows && existingUser.rows.length > 0) {
             return res.status(400).json({ error: 'Email already registered' });
