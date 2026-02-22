@@ -469,8 +469,10 @@ app.put('/api/auth/update-profile', async (req, res) => {
 });
 
 // ========== REGISTER AS FARMER ==========
+// POST /api/auth/register-farmer
 app.post('/api/auth/register-farmer', async (req, res) => {
-    console.log('Register as farmer endpoint called');
+    console.log('🔥 FARMER REGISTRATION CALLED');
+    console.log('📦 Request body:', req.body); // This will show what's being sent
 
     try {
         // 1️⃣ Get token
@@ -487,6 +489,11 @@ app.post('/api/auth/register-farmer', async (req, res) => {
 
         // 2️⃣ Get request body
         const { farm_name, farm_location, farm_description } = req.body;
+
+        console.log('📍 Extracted values:');
+        console.log('   - farm_name:', farm_name);
+        console.log('   - farm_location:', farm_location);
+        console.log('   - farm_description:', farm_description); // CRITICAL: Check this
 
         if (!farm_name) {
             return res.status(400).json({
@@ -509,7 +516,7 @@ app.post('/api/auth/register-farmer', async (req, res) => {
             });
         }
 
-        // 4️⃣ Insert farmer 
+        // 4️⃣ Insert farmer with ALL fields
         const result = await pool.query(
             `INSERT INTO farmers (
                 user_id,
@@ -530,9 +537,12 @@ app.post('/api/auth/register-farmer', async (req, res) => {
                 decoded.user_id,
                 farm_name,
                 farm_location || null,
-                farm_description || null
+                farm_description || null  // This should save the description
             ]
         );
+
+        console.log('✅ Farmer inserted successfully!');
+        console.log('   - Inserted farm_description:', result.rows[0].farm_description);
 
         // 5️⃣ Update user role to FARMER
         await pool.query(
@@ -549,7 +559,9 @@ app.post('/api/auth/register-farmer', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Farmer registration error:', error);
+        console.error('❌ Farmer registration error:', error);
+        console.error('   - Error message:', error.message);
+        console.error('   - Error code:', error.code);
 
         if (error.name === 'JsonWebTokenError') {
             return res.status(401).json({
@@ -560,7 +572,8 @@ app.post('/api/auth/register-farmer', async (req, res) => {
 
         res.status(500).json({
             success: false,
-            error: 'Failed to register as farmer'
+            error: 'Failed to register as farmer',
+            details: error.message
         });
     }
 });
