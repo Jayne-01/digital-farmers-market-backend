@@ -50,14 +50,13 @@ const getFarmerDashboard = async (req, res) => {
             console.error('Error fetching unavailable products:', unavailableError);
         }
 
-        // FIXED: Added farm_description to the response
+        
         res.json({
             farmer: {
                 farmer_id: farmer.farmer_id,
                 farm_name: farmer.farm_name,
                 barangay: farmer.barangay,
-                farm_description: farmer.farm_description, // ✅ ADDED THIS
-                product_categories: farmer.product_categories,
+                farm_description: farmer.farm_description, 
                 verified_status: farmer.verified_status || false
             },
             statistics: statsResult.rows[0] || {
@@ -80,8 +79,8 @@ const getFarmerDashboard = async (req, res) => {
 
 const updateFarmerProfile = async (req, res) => {
     try {
-        // FIXED: Added farm_description to destructuring
-        const { farm_name, barangay, farm_description, product_categories } = req.body;
+    
+        const { farm_name, barangay, farm_description } = req.body;
         
         const farmerResult = await Farmer.findByUserId(req.user.user_id);
         if (farmerResult.rows.length === 0) {
@@ -93,8 +92,7 @@ const updateFarmerProfile = async (req, res) => {
 
         if (farm_name) updateData.farm_name = farm_name;
         if (barangay) updateData.barangay = barangay;
-        if (farm_description) updateData.farm_description = farm_description; // ✅ ADDED THIS
-        if (product_categories) updateData.product_categories = product_categories;
+        if (farm_description) updateData.farm_description = farm_description; 
 
         if (Object.keys(updateData).length === 0) {
             return res.status(400).json({ error: 'No data provided for update' });
