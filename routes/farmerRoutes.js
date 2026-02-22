@@ -30,19 +30,13 @@ router.put('/profile', async (req, res) => {
         // Validation 
         if (!farm_name && !barangay && !farm_description && !product_categories) {
             return res.status(400).json({ 
-                message: 'At least one field is required for update: farm_name, barangay, farm_description, or product_categories' 
+                message: 'At least one field is required for update: farm_name, barangay, farm_description' 
             });
         }
 
         if (farm_name && farm_name.trim().length < 2) {
             return res.status(400).json({ 
                 message: 'Farm name must be at least 2 characters long' 
-            });
-        }
-
-        if (product_categories && (!Array.isArray(product_categories) || product_categories.length === 0)) {
-            return res.status(400).json({ 
-                message: 'Product categories must be a non-empty array' 
             });
         }
 
