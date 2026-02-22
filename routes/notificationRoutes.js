@@ -1,17 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const NotificationController = require('../controllers/notificationController');
-const { authenticateToken } = require('../middleware/auth'); 
-// All notification routes require authentication
+const { getNotifications, markAsRead, markAllAsRead } = require('../controllers/notificationController');
+const { authenticateToken } = require('../middleware/auth');
+
 router.use(authenticateToken);
 
-// GET /api/notifications
-router.get('/', NotificationController.getNotifications);
-
-// PUT /api/notifications/:id/read
-router.put('/:id/read', NotificationController.markAsRead);
-
-// PUT /api/notifications/mark-all-read
-router.put('/mark-all-read', NotificationController.markAllAsRead);
+router.get('/', getNotifications);
+router.put('/:id/read', markAsRead);
+router.put('/mark-all-read', markAllAsRead);
 
 module.exports = router;
