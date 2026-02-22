@@ -23,7 +23,7 @@ const getFarmerDashboard = async (req, res) => {
             const ordersQuery = `
                 SELECT o.*, u.full_name as customer_name
                 FROM orders o
-                JOIN users u ON o.user_id = u.user_id
+                JOIN users u ON o.customer_id = u.user_id
                 WHERE o.farmer_id = $1
                 ORDER BY o.order_date DESC
                 LIMIT 5
@@ -50,24 +50,23 @@ const getFarmerDashboard = async (req, res) => {
             console.error('Error fetching unavailable products:', unavailableError);
         }
 
+        // FIXED: Added farm_description to the response
         res.json({
             farmer: {
                 farmer_id: farmer.farmer_id,
                 farm_name: farmer.farm_name,
                 barangay: farmer.barangay,
+                farm_description: farmer.farm_description, // ✅ ADDED THIS
                 product_categories: farmer.product_categories,
                 verified_status: farmer.verified_status || false
-                
             },
             statistics: statsResult.rows[0] || {
                 total_products: 0,
                 total_orders: 0,
                 total_sales: 0
-                
             },
             recent_orders: recentOrders.rows.slice(0, 5),
             unavailable_products: unavailableProducts.rows.slice(0, 5)
-            
         });
         
     } catch (error) {
@@ -81,7 +80,8 @@ const getFarmerDashboard = async (req, res) => {
 
 const updateFarmerProfile = async (req, res) => {
     try {
-        const { farm_name, barangay, product_categories } = req.body;
+        // FIXED: Added farm_description to destructuring
+        const { farm_name, barangay, farm_description, product_categories } = req.body;
         
         const farmerResult = await Farmer.findByUserId(req.user.user_id);
         if (farmerResult.rows.length === 0) {
@@ -93,6 +93,7 @@ const updateFarmerProfile = async (req, res) => {
 
         if (farm_name) updateData.farm_name = farm_name;
         if (barangay) updateData.barangay = barangay;
+        if (farm_description) updateData.farm_description = farm_description; // ✅ ADDED THIS
         if (product_categories) updateData.product_categories = product_categories;
 
         if (Object.keys(updateData).length === 0) {

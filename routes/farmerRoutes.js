@@ -24,12 +24,13 @@ router.get('/dashboard', async (req, res) => {
 // PUT /api/farmers/profile - Update farmer profile
 router.put('/profile', async (req, res) => {
     try {
-        const { farm_name, barangay, product_categories } = req.body;
+        //  destructuring
+        const { farm_name, barangay, farm_description, product_categories } = req.body;
         
-        // Validation
-        if (!farm_name && !barangay && !product_categories) {
+        // Validation 
+        if (!farm_name && !barangay && !farm_description && !product_categories) {
             return res.status(400).json({ 
-                message: 'At least one field is required for update: farm_name, barangay, or product_categories' 
+                message: 'At least one field is required for update: farm_name, barangay, farm_description, or product_categories' 
             });
         }
 
