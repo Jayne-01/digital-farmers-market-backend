@@ -1,11 +1,11 @@
 // controllers/orderController.js
 const db = require('../config/database');
 const Farmer = require('../models/farmerModel');
+const NotificationModel = require('../models/notificationModel');
 
 // POST /api/orders - Create order
 const createOrder = async (req, res) => {
     try {
-        // Implementation for creating order
         // This should move items from cart to orders
         res.json({ 
             success: true, 
@@ -462,6 +462,28 @@ const updateOrderStatus = async (req, res) => {
 
         const result = await db.query(updateQuery, [status, id]);
         
+        //  NOTIFICATION 
+        try {
+            // Get customer ID from the updated order
+            const customerId = result.rows[0].customer_id;
+
+            // Prepare message based on new status
+            const statusMessages = {
+                'PENDING': 'Your order has been received and is waiting for confirmation.',
+                'CONFIRMED': 'Good news! Your order has been confirmed and is now being prepared.',
+                'IN_TRANSIT': 'Your order is on the way! Please expect delivery soon.',
+                'DELIVERED': 'Your order has been successfully delivered. Thank you for supporting local farmers!',
+                'CANCELLED': 'Unfortunately, your order has been cancelled.'
+            };
+            const message = statusMessages[status] || `Your order status changed to ${status}.`;
+
+            // Insert notification
+            await NotificationModel.create(customerId, id, 'status_update', message);
+        } catch (notifError) {
+            // Log error but don't fail the whole request – the status update was successful
+            console.error('Failed to create notification:', notifError);
+        }
+
         // Transform the response
         const updatedOrder = {
             order_id: result.rows[0].order_id,
