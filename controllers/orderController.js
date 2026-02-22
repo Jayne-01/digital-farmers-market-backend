@@ -493,6 +493,69 @@ const updateOrderStatus = async (req, res) => {
     }
 };
 
+// GET /api/orders/my-purchases - Get orders placed by the logged-in user (any role)
+const getMyPurchases = async (req, res) => {
+    try {
+        const user_id = req.user.user_id; // works for both customers and farmers
+
+        const query = `
+            SELECT 
+                o.order_id,
+                o.customer_id,
+                o.farmer_id,
+                o.total_amount,
+                o.order_status as status,
+                o.payment_method,
+                o.delivery_option,
+                o.address,
+                o.contact_number,
+                o.order_date,
+                f.farm_name,
+                (
+                    SELECT COALESCE(json_agg(
+                        json_build_object(
+                            'order_item_id', oi.order_item_id,
+                            'product_id', oi.product_id,
+                            'product_name', p.product_name,
+                            'quantity', oi.quantity,
+                            'price', oi.price,
+                            'image_url', p.image_url
+                        )
+                    ), '[]'::json)
+                    FROM order_items oi
+                    JOIN products p ON oi.product_id = p.product_id
+                    WHERE oi.order_id = o.order_id
+                ) as items
+            FROM orders o
+            LEFT JOIN farmers f ON o.farmer_id = f.farmer_id
+            WHERE o.customer_id = $1
+            ORDER BY o.order_date DESC
+        `;
+
+        const result = await db.query(query, [user_id]);
+        
+        // Transform the data for frontend
+        const orders = result.rows.map(order => ({
+            ...order,
+            delivery_address: order.address,
+            items: order.items || []
+        }));
+        
+        res.json({
+            success: true,
+            orders: orders
+        });
+
+    } catch (error) {
+        console.error('Get my purchases error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Server error',
+            details: error.message 
+        });
+    }
+};
+
 // Make sure ALL functions are exported
 module.exports = {
     createOrder,
@@ -500,5 +563,6 @@ module.exports = {
     getFarmerOrders,
     getOrderById,
     getOrderItems,
-    updateOrderStatus
+    updateOrderStatus,
+    getMyPurchases
 };

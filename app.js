@@ -1108,6 +1108,7 @@ app.use('*', (req, res) => {
             'GET  /api/orders/:id (Get order by ID - requires token)',
             'PUT  /api/orders/:id/status (Update status - requires token)',
             'GET  /api/orders/:id/items (Get order items - requires token)',
+            'GET  /api/orders/my-purchases',
 
             //cart endpoints
             'GET /api/cart',
@@ -1198,6 +1199,7 @@ app.listen(PORT, () => {
     console.log(`   • GET  /api/orders/:id  (Get specific order)`);
     console.log(`   • PUT  /api/orders/:id/status (Update order status)`);
     console.log(`   • GET  /api/orders/:id/items  (Get order items)`);
+    console.log(`   • GET  /api/orders/my-purchases`);
 
 
     console.log(`\n   🔐 RECOMMENDATION ENDPOINTS (Requires token):`);

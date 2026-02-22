@@ -46,4 +46,10 @@ router.put('/:id/status',
     orderController.updateOrderStatus
 );
 
+// GET /api/orders/my-purchases - Get orders placed by the logged-in user (any role)
+router.get('/my-purchases', 
+    authenticateToken,  // no role check – any authenticated user
+    orderController.getMyPurchases
+);
+
 module.exports = router;
