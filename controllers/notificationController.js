@@ -1,10 +1,6 @@
 const NotificationModel = require('../models/notificationModel');
 
 const NotificationController = {
-    /**
-     * GET /api/notifications
-     * Retrieve user's notifications
-     */
     async getNotifications(req, res) {
         try {
             const userId = req.user.user_id; // from auth middleware
@@ -18,10 +14,7 @@ const NotificationController = {
         }
     },
 
-    /**
-     * PUT /api/notifications/:id/read
-     * Mark a single notification as read
-     */
+
     async markAsRead(req, res) {
         try {
             const userId = req.user.user_id;
@@ -39,10 +32,7 @@ const NotificationController = {
         }
     },
 
-    /**
-     * PUT /api/notifications/mark-all-read
-     * Mark all user's notifications as read
-     */
+   
     async markAllAsRead(req, res) {
         try {
             const userId = req.user.user_id;

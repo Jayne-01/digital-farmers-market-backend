@@ -15,6 +15,7 @@ const farmerRoutes = require('./routes/farmerRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const recommendationRoutes = require('./routes/recommendationRoutes');
 const cartRoutes = require('./routes/cartRoutes');
+const notificationRoutes = require('./routes/notificationRoutes');
 
 const app = express();
 
@@ -1037,6 +1038,9 @@ app.use('/api/recommendations', recommendationRoutes);
 // ========== ERROR HANDLING ==========
 app.use('/api/cart', cartRoutes);
 
+// ========== NOTIFICATION ==========
+app.use('/api/notifications', notificationRoutes);
+
 // ========== ERROR HANDLING ==========
 app.use((err, req, res, next) => {
     console.error('❌ Server error:', err.stack);
@@ -1125,6 +1129,11 @@ app.use('*', (req, res) => {
             'GET /api/recommendations/personalized (Customer only)',
             'GET /api/recommendations/demand-analysis (Farmer only)',
 
+            //Notification
+            'GET /api/notifications',
+            'PUT /api/notifications/:id',
+            'PUT /api/notifications/mark-all-read',
+
             //health check
             'GET /health',
         ]
@@ -1207,6 +1216,12 @@ app.listen(PORT, () => {
     console.log(`   • GET /api/recommendations/seasonal            (Seasonal recommendations)`);
     console.log(`   • GET /api/recommendations/personalized        (Personalized - Customer only)`);
     console.log(`   • GET /api/recommendations/demand-analysis     (Demand analysis - Farmer only)`);
+
+    console.log(`\n   🔐 NOTIFICATIONS:`);
+    console.log(`   • GET /api/notifications`);
+    console.log(`   • GET /api/notifications/:id`);
+    console.log(`   • GET /api/notifications/mark-all-read`);
+    
 
     console.log('\n Cart Endpoints:')
     console.log(`   • GET /api/cart`);
