@@ -88,19 +88,34 @@ const register = async (req, res) => {
 
 const login = async (req, res) => {
     try {
+        console.log('🔥 Login attempt for email:', req.body.email);
         const { email, password } = req.body;
+        
+        console.log('📧 Looking for user with email:', email);
 
         // Find user
         const userResult = await User.findByEmail(email);
+        console.log('📦 User result from DB:', userResult ? 'Found' : 'Not found');
+        
         if (!userResult || (userResult.rows && userResult.rows.length === 0)) {
+            console.log('❌ No user found with email:', email);
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
         const user = userResult.rows ? userResult.rows[0] : userResult;
+        console.log('👤 User found:', { 
+            user_id: user.user_id, 
+            email: user.email,
+            hasPassword: !!user.password 
+        });
 
         // Check password
+        console.log('🔐 Comparing passwords...');
         const validPassword = await bcrypt.compare(password, user.password);
+        console.log('✅ Password valid:', validPassword);
+        
         if (!validPassword) {
+            console.log('❌ Invalid password for user:', email);
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
@@ -115,20 +130,10 @@ const login = async (req, res) => {
             { expiresIn: '7d' }
         );
 
-        // Get additional farmer info if applicable
-        let farmerProfile = null;
-        if (user.role === 'FARMER') {
-            try {
-                const farmerResult = await Farmer.findByUserId(user.user_id || user.id);
-                if (farmerResult && farmerResult.rows && farmerResult.rows.length > 0) {
-                    farmerProfile = farmerResult.rows[0];
-                }
-            } catch (error) {
-                console.error('Error fetching farmer profile:', error);
-            }
-        }
-
+        console.log('✅ Login successful for:', email);
+        
         res.json({
+            success: true,
             message: 'Login successful',
             token,
             user: {
@@ -138,12 +143,11 @@ const login = async (req, res) => {
                 role: user.role,
                 contact_number: user.contact_number,
                 address: user.address,
-                barangay: user.barangay,
-                farmer_profile: farmerProfile
+                barangay: user.barangay
             }
         });
     } catch (error) {
-        console.error('Login error:', error);
+        console.error('💥 Login error:', error);
         res.status(500).json({ error: 'Server error during login' });
     }
 };

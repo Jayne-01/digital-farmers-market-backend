@@ -43,6 +43,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
 app.use('/uploads', express.static('uploads'));
+app.use(express.static('C:/Users/Jorinna/OneDrive/Desktop/digital-farmers-market-frontend'));
 
 // Request logging
 app.use((req, res, next) => {
