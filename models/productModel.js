@@ -1,22 +1,25 @@
 const db = require('../config/database');
 
 class Product {
-    // Create a new product
+    // Create a new product - UPDATED WITH STOCK
     static async create(productData) {
-        const {farmer_id, product_name, category, price, harvest_date, description, image_url, status } = productData;
+        const {farmer_id, product_name, category, price, unit, stock, harvest_date, description, image_url, status } = productData;
         
-        const query = `INSERT INTO products (farmer_id,  product_name, category, price, harvest_date, description, image_url, status )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)RETURNING *`;
+        const query = `INSERT INTO products (farmer_id, product_name, category, price, unit, stock, harvest_date, description, image_url, status, sold_count)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`;
         
         const values = [
             farmer_id, 
             product_name, 
             category, 
             price, 
+            unit || 'kg',
+            stock || 0,
             harvest_date || null, 
             description || '', 
             image_url || '', 
-            status || 'AVAILABLE'
+            status || 'AVAILABLE',
+            0 // sold_count starts at 0
         ];
         
         return await db.query(query, values);
@@ -24,7 +27,7 @@ class Product {
 
     // Get all products by a specific farmer
     static async findByFarmer(farmer_id) {
-        const query = ` SELECT  p.*, f.farm_name, u.full_name as farmer_name, u.contact_number, u.barangay
+        const query = ` SELECT p.*, f.farm_name, u.full_name as farmer_name, u.contact_number, u.barangay
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
@@ -44,7 +47,7 @@ class Product {
         const query = `
             SELECT 
                 p.*,
-                f.farm_name, f.verified_status, u.full_name as farmer_name, u.contact_number, u.email,  u.barangay
+                f.farm_name, f.verified_status, u.full_name as farmer_name, u.contact_number, u.email, u.barangay
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
@@ -80,6 +83,11 @@ class Product {
         } else {
             // Default: only show available products
             query += ` AND p.status = 'AVAILABLE'`;
+        }
+
+        // Only show products with stock > 0 for customers
+        if (!filters.includeOutOfStock) {
+            query += ` AND p.stock > 0`;
         }
 
         // Category filter
@@ -131,6 +139,9 @@ class Product {
                 case 'views':
                     orderBy = 'view_count DESC';
                     break;
+                case 'popular':
+                    orderBy = 'p.sold_count DESC';
+                    break;
                 default:
                     orderBy = 'p.created_at DESC';
             }
@@ -152,7 +163,7 @@ class Product {
         return await db.query(query, values);
     }
 
-    // Update product
+    // Update product - UPDATED WITH STOCK
     static async update(product_id, updateData) {
         const fields = [];
         const values = [];
@@ -162,7 +173,7 @@ class Product {
         for (const [key, value] of Object.entries(updateData)) {
             // Only allow certain fields to be updated
             const allowedFields = [
-                'product_name', 'category', 'price', 'harvest_date', 
+                'product_name', 'category', 'price', 'unit', 'stock', 'harvest_date', 
                 'description', 'image_url', 'status'
             ];
             
@@ -198,6 +209,43 @@ class Product {
             RETURNING *
         `;
         return await db.query(query, [status, product_id]);
+    }
+
+    // Update stock when order is placed
+    static async decreaseStock(product_id, quantity) {
+        const query = `
+            UPDATE products 
+            SET stock = stock - $1,
+                sold_count = sold_count + $1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE product_id = $2 AND stock >= $1
+            RETURNING *
+        `;
+        return await db.query(query, [quantity, product_id]);
+    }
+
+    // Restore stock when order is cancelled
+    static async increaseStock(product_id, quantity) {
+        const query = `
+            UPDATE products 
+            SET stock = stock + $1,
+                sold_count = sold_count - $1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE product_id = $2
+            RETURNING *
+        `;
+        return await db.query(query, [quantity, product_id]);
+    }
+
+    // Check stock availability
+    static async checkStock(product_id, requestedQuantity) {
+        const query = `
+            SELECT stock FROM products 
+            WHERE product_id = $1
+        `;
+        const result = await db.query(query, [product_id]);
+        if (result.rows.length === 0) return false;
+        return result.rows[0].stock >= requestedQuantity;
     }
 
     // Delete product (soft delete by updating status)
@@ -248,9 +296,29 @@ class Product {
             JOIN users u ON f.user_id = u.user_id
             LEFT JOIN product_views pv ON p.product_id = pv.product_id
             WHERE p.status = 'AVAILABLE'
+            AND p.stock > 0
             AND f.verified_status = true
             GROUP BY p.product_id, f.farm_name, u.full_name, u.barangay
             ORDER BY view_count DESC
+            LIMIT $1
+        `;
+        return await db.query(query, [limit]);
+    }
+
+    // Get best selling products
+    static async getBestSellingProducts(limit = 10) {
+        const query = `
+            SELECT 
+                p.*,
+                f.farm_name,
+                u.full_name as farmer_name,
+                u.barangay
+            FROM products p
+            JOIN farmers f ON p.farmer_id = f.farmer_id
+            JOIN users u ON f.user_id = u.user_id
+            WHERE p.status = 'AVAILABLE'
+            AND f.verified_status = true
+            ORDER BY p.sold_count DESC
             LIMIT $1
         `;
         return await db.query(query, [limit]);
@@ -269,6 +337,7 @@ class Product {
             JOIN users u ON f.user_id = u.user_id
             WHERE p.category = $1
             AND p.status = 'AVAILABLE'
+            AND p.stock > 0
             AND f.verified_status = true
             ORDER BY p.created_at DESC
             LIMIT $2
@@ -307,6 +376,7 @@ class Product {
                 OR u.barangay ILIKE $1
             )
             AND p.status = 'AVAILABLE'
+            AND p.stock > 0
             AND f.verified_status = true
         `;
 
@@ -351,6 +421,8 @@ class Product {
                 COUNT(*) as total_products,
                 COUNT(CASE WHEN status = 'AVAILABLE' THEN 1 END) as available_products,
                 COUNT(CASE WHEN status = 'UNAVAILABLE' THEN 1 END) as unavailable_products,
+                COALESCE(SUM(p.stock), 0) as total_stock,
+                COALESCE(SUM(p.sold_count), 0) as total_sold,
                 COALESCE(SUM(pv.view_count), 0) as total_views,
                 COALESCE(AVG(p.price), 0) as average_price,
                 MIN(p.created_at) as first_product_date,
@@ -365,6 +437,19 @@ class Product {
             GROUP BY p.farmer_id
         `;
         return await db.query(query, [farmer_id]);
+    }
+
+    // Get low stock products
+    static async getLowStockProducts(farmer_id, threshold = 5) {
+        const query = `
+            SELECT *
+            FROM products
+            WHERE farmer_id = $1
+            AND status = 'AVAILABLE'
+            AND stock <= $2
+            ORDER BY stock ASC
+        `;
+        return await db.query(query, [farmer_id, threshold]);
     }
 
     // Get products with pagination
@@ -382,6 +467,7 @@ class Product {
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
             WHERE p.status = 'AVAILABLE'
+            AND p.stock > 0
             AND f.verified_status = true
             ORDER BY p.created_at DESC
             LIMIT $1 OFFSET $2
@@ -393,6 +479,7 @@ class Product {
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             WHERE p.status = 'AVAILABLE'
+            AND p.stock > 0
             AND f.verified_status = true
         `;
 

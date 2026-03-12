@@ -1,3 +1,4 @@
+// controllers/cartController.js
 const cartModel = require('../models/cartModel');
 
 const cartController = {
@@ -170,7 +171,7 @@ const cartController = {
         }
     },
 
-    // Checkout// In cartController.js
+    // Checkout
     async checkout(req, res) {
         try {
             const userId = req.user.user_id;

@@ -22,11 +22,13 @@ const getFarmerProducts = async (req, res) => {
         const farmer_id = farmerResult.rows[0].farmer_id;
         console.log('Farmer ID:', farmer_id);
 
-        // Get ONLY this farmer's products
+        // Get ONLY this farmer's products with stock information
         const query = `
             SELECT 
                 p.*,
-                COUNT(DISTINCT oi.order_item_id) as times_sold
+                COUNT(DISTINCT oi.order_item_id) as times_sold,
+                p.stock as current_stock,
+                p.sold_count as total_sold
             FROM products p
             LEFT JOIN order_items oi ON p.product_id = oi.product_id
             WHERE p.farmer_id = $1
@@ -60,7 +62,8 @@ const getAllProducts = async (req, res) => {
         const { category, minPrice, maxPrice, sort, page = 1, limit = 12 } = req.query;
         
         let query = `
-            SELECT p.*, f.farm_name, f.barangay 
+            SELECT p.*, f.farm_name, f.barangay,
+                   CASE WHEN p.stock > 0 THEN true ELSE false END as in_stock
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             WHERE p.status = 'AVAILABLE'
@@ -92,7 +95,7 @@ const getAllProducts = async (req, res) => {
                 query += ' ORDER BY p.price DESC';
                 break;
             case 'popular':
-                query += ' ORDER BY p.times_sold DESC NULLS LAST';
+                query += ' ORDER BY p.sold_count DESC NULLS LAST';
                 break;
             default:
                 query += ' ORDER BY p.created_at DESC';
@@ -143,7 +146,8 @@ const searchProducts = async (req, res) => {
         }
 
         const sql = `
-            SELECT p.*, f.farm_name, f.barangay 
+            SELECT p.*, f.farm_name, f.barangay,
+                   CASE WHEN p.stock > 0 THEN true ELSE false END as in_stock
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             WHERE p.status = 'AVAILABLE' 
@@ -174,7 +178,8 @@ const getProductsByCategory = async (req, res) => {
         const { category } = req.params;
         
         const query = `
-            SELECT p.*, f.farm_name, f.barangay 
+            SELECT p.*, f.farm_name, f.barangay,
+                   CASE WHEN p.stock > 0 THEN true ELSE false END as in_stock
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             WHERE p.category = $1 AND p.status = 'AVAILABLE'
@@ -204,7 +209,8 @@ const getProductById = async (req, res) => {
         const { id } = req.params;
         
         const query = `
-            SELECT p.*, f.farm_name, f.barangay, f.farmer_id
+            SELECT p.*, f.farm_name, f.barangay, f.farmer_id,
+                   CASE WHEN p.stock > 0 THEN true ELSE false END as in_stock
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             WHERE p.product_id = $1
@@ -233,7 +239,7 @@ const getProductById = async (req, res) => {
     }
 };
 
-// Create new product (farmer only)
+// Create new product (farmer only) - UPDATED WITH STOCK
 const createProduct = async (req, res) => {
     try {
         console.log('Creating product for user:', req.user.user_id);
@@ -248,15 +254,23 @@ const createProduct = async (req, res) => {
         }
 
         const farmer_id = farmerResult.rows[0].farmer_id;
-        const { product_name, category, price, harvest_date, description } = req.body;
+        const { product_name, category, price, unit, stock, harvest_date, description } = req.body;
         
-        console.log('Received data:', { product_name, category, price, harvest_date, description });
+        console.log('Received data:', { product_name, category, price, unit, stock, harvest_date, description });
         
-        // Validate required fields
-        if (!product_name || !category || !price) {
+        // Validate required fields - ADDED STOCK
+        if (!product_name || !category || !price || !unit || stock === undefined) {
             return res.status(400).json({ 
                 success: false, 
-                error: 'Missing required fields: product_name, category, and price are required' 
+                error: 'Missing required fields: product_name, category, price, unit, and stock are required' 
+            });
+        }
+
+        // Validate stock is a positive number
+        if (parseInt(stock) < 0) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Stock cannot be negative' 
             });
         }
 
@@ -269,13 +283,13 @@ const createProduct = async (req, res) => {
 
         const query = `
             INSERT INTO products (
-                farmer_id, product_name, category, price, 
+                farmer_id, product_name, category, price, unit, stock,
                 harvest_date, description, image_url, status, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'AVAILABLE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             RETURNING *
         `;
 
-        const values = [farmer_id, product_name, category, price, harvest_date || null, description || null, image_url];
+        const values = [farmer_id, product_name, category, price, unit, stock, harvest_date || null, description || null, image_url];
         const result = await db.query(query, values);
         
         console.log('Product created:', result.rows[0]);
@@ -296,7 +310,7 @@ const createProduct = async (req, res) => {
     }
 };
 
-// Update product (farmer only) - COMPLETELY FIXED VERSION
+// Update product (farmer only) - FIXED WITH STOCK
 const updateProduct = async (req, res) => {
     try {
         const { id } = req.params;
@@ -330,6 +344,8 @@ const updateProduct = async (req, res) => {
         const product_name = req.body.product_name;
         const category = req.body.category;
         const price = req.body.price;
+        const unit = req.body.unit;
+        const stock = req.body.stock; // ADDED STOCK
         const harvest_date = req.body.harvest_date;
         const description = req.body.description;
         const status = req.body.status;
@@ -338,6 +354,8 @@ const updateProduct = async (req, res) => {
             product_name,
             category,
             price,
+            unit,
+            stock, // ADDED STOCK
             harvest_date,
             description,
             status
@@ -360,12 +378,28 @@ const updateProduct = async (req, res) => {
             updates.push(`price = $${paramIndex++}`);
             values.push(price);
         }
+        if (unit !== undefined) {
+            console.log('Adding unit to update:', unit);
+            updates.push(`unit = $${paramIndex++}`);
+            values.push(unit);
+        }
+        // FIXED: Added stock update block
+        if (stock !== undefined) {
+            console.log('Adding stock to update:', stock);
+            // Validate stock is not negative
+            if (parseInt(stock) < 0) {
+                return res.status(400).json({ 
+                    success: false, 
+                    error: 'Stock cannot be negative' 
+                });
+            }
+            updates.push(`stock = $${paramIndex++}`);
+            values.push(stock);
+        }
         
-        // SIMPLE FIX: Check if harvest_date exists by comparing to undefined
         if (harvest_date !== undefined) {
             console.log('Adding harvest_date to update:', harvest_date);
             updates.push(`harvest_date = $${paramIndex++}`);
-            // If harvest_date is empty string, set to null
             values.push(harvest_date === '' ? null : harvest_date);
         }
         

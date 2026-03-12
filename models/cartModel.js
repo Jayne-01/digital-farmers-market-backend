@@ -12,9 +12,11 @@ const cartModel = {
                 ci.created_at,
                 p.product_name,
                 p.price,
+                p.unit,
                 p.image_url,
                 p.status AS product_status,
-                f.farmer_id,
+                p.stock,
+                p.farmer_id,
                 f.farm_name,
                 f.barangay
             FROM cart_items ci
@@ -39,6 +41,13 @@ const cartModel = {
             throw new Error('Product not available');
         }
         
+        const product = productCheck.rows[0];
+        
+        // Check if enough stock
+        if (product.stock < quantity) {
+            throw new Error(`Only ${product.stock} ${product.unit}${product.stock !== 1 ? 's' : ''} available`);
+        }
+        
         // Check if already in cart
         const existing = await pool.query(
             'SELECT * FROM cart_items WHERE user_id = $1 AND product_id = $2 AND status = $3',
@@ -48,6 +57,12 @@ const cartModel = {
         let result;
         
         if (existing.rows.length > 0) {
+            // Check if total quantity would exceed stock
+            const newQuantity = existing.rows[0].quantity + quantity;
+            if (newQuantity > product.stock) {
+                throw new Error(`Cannot add ${quantity} more. Only ${product.stock - existing.rows[0].quantity} ${product.unit}${product.stock - existing.rows[0].quantity !== 1 ? 's' : ''} available`);
+            }
+            
             // Update quantity
             result = await pool.query(
                 `UPDATE cart_items 
@@ -82,7 +97,7 @@ const cartModel = {
     // Update cart item quantity
     async updateCartItem(cartItemId, userId, newQuantity) {
         const check = await pool.query(
-            'SELECT * FROM cart_items WHERE cart_item_id = $1 AND user_id = $2',
+            'SELECT ci.*, p.stock FROM cart_items ci JOIN products p ON ci.product_id = p.product_id WHERE ci.cart_item_id = $1 AND ci.user_id = $2',
             [cartItemId, userId]
         );
         
@@ -92,6 +107,12 @@ const cartModel = {
         
         if (newQuantity < 1) {
             throw new Error('Quantity cannot be less than 1');
+        }
+        
+        // Check if enough stock
+        const product = check.rows[0];
+        if (newQuantity > product.stock) {
+            throw new Error(`Only ${product.stock} available`);
         }
         
         const result = await pool.query(
@@ -134,7 +155,7 @@ const cartModel = {
         return true;
     },
 
-    // Checkout - create order from cart (with customer full name)
+    // Checkout - FIXED to use correct farmer_id from products table
     async checkout(userId, orderDetails) {
         const client = await pool.connect();
         
@@ -153,15 +174,17 @@ const cartModel = {
             
             const customerName = userResult.rows[0].full_name;
             
-            // Get cart items
+            // Get cart items with product details including farmer_id
             const cartItems = await client.query(`
                 SELECT 
                     ci.cart_item_id,
                     ci.product_id,
                     ci.quantity,
                     p.price,
-                    p.farmer_id,
-                    p.product_name
+                    p.farmer_id,  -- This is the farmer_id from products table (links to farmers table)
+                    p.product_name,
+                    p.stock,
+                    p.unit
                 FROM cart_items ci
                 JOIN products p ON ci.product_id = p.product_id
                 WHERE ci.user_id = $1 AND ci.status = 'ACTIVE'
@@ -171,19 +194,16 @@ const cartModel = {
                 throw new Error('Cart is empty');
             }
             
-            // Check if all products are still available
+            console.log('Cart items for checkout:', cartItems.rows);
+            
+            // Check if all products are still available and have enough stock
             for (const item of cartItems.rows) {
-                const productCheck = await client.query(
-                    'SELECT status FROM products WHERE product_id = $1',
-                    [item.product_id]
-                );
-                
-                if (productCheck.rows.length === 0 || productCheck.rows[0].status !== 'AVAILABLE') {
-                    throw new Error(`Product ID ${item.product_id} is no longer available`);
+                if (item.quantity > item.stock) {
+                    throw new Error(`Insufficient stock for ${item.product_name}. Available: ${item.stock} ${item.unit}${item.stock !== 1 ? 's' : ''}, Requested: ${item.quantity}`);
                 }
             }
             
-            // Calculate subtotal only (no delivery fee)
+            // Calculate subtotal
             const subtotal = cartItems.rows.reduce((sum, item) => 
                 sum + (parseFloat(item.price) * item.quantity), 0
             );
@@ -191,19 +211,23 @@ const cartModel = {
             // Convert delivery option to match database CHECK constraint
             const delivery_option = orderDetails.delivery_option === 'DELIVERY' ? 'Home Delivery' : 'Pick-Up';
             
-            // Group items by farmer
+            // Group items by farmer (using farmer_id from products table)
             const farmerOrders = {};
             for (const item of cartItems.rows) {
-                if (!farmerOrders[item.farmer_id]) {
-                    farmerOrders[item.farmer_id] = {
-                        farmer_id: item.farmer_id,
+                const farmerId = item.farmer_id; // This comes from products table
+                
+                if (!farmerOrders[farmerId]) {
+                    farmerOrders[farmerId] = {
+                        farmer_id: farmerId,
                         items: [],
                         subtotal: 0
                     };
                 }
-                farmerOrders[item.farmer_id].items.push(item);
-                farmerOrders[item.farmer_id].subtotal += parseFloat(item.price) * item.quantity;
+                farmerOrders[farmerId].items.push(item);
+                farmerOrders[farmerId].subtotal += parseFloat(item.price) * item.quantity;
             }
+            
+            console.log('Grouped by farmer:', farmerOrders);
             
             const orders = [];
             
@@ -212,12 +236,14 @@ const cartModel = {
                 const group = farmerOrders[farmerId];
                 const farmer_total = group.subtotal;
                 
-                // FIXED: Added customer_name to the INSERT query
+                console.log(`Creating order for farmer_id: ${farmerId} with total: ${farmer_total}`);
+                
+                // Create order with the correct farmer_id (from products table)
                 const orderResult = await client.query(
                     `INSERT INTO orders (
                         customer_id,
                         customer_name,
-                        farmer_id,
+                        farmer_id,  -- This should be the farmer_id from farmers table, NOT user_id
                         total_amount,
                         address,
                         contact_number,
@@ -228,26 +254,37 @@ const cartModel = {
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
                     RETURNING order_id`,
                     [
-                        userId,
-                        customerName,
-                        parseInt(farmerId),
-                        farmer_total,
-                        orderDetails.address || null,
-                        orderDetails.contact_number || null,
-                        delivery_option,
-                        orderDetails.payment_method || 'COD',
-                        'PENDING'
+                        userId,                          // customer_id (from users table)
+                        customerName,                    // customer_name
+                        parseInt(farmerId),              // farmer_id (from farmers table, NOT user_id)
+                        farmer_total,                     // total_amount
+                        orderDetails.address || null,    // address
+                        orderDetails.contact_number || null, // contact_number
+                        delivery_option,                  // delivery_option
+                        orderDetails.payment_method || 'COD', // payment_method
+                        'PENDING'                          // order_status
                     ]
                 );
                 
                 const order_id = orderResult.rows[0].order_id;
+                console.log(`Created order ${order_id} for farmer ${farmerId}`);
                 
-                // Add items for this order
+                // Add items for this order and DECREMENT STOCK
                 for (const item of group.items) {
                     await client.query(
                         `INSERT INTO order_items (order_id, product_id, quantity, price) 
                          VALUES ($1, $2, $3, $4)`,
                         [order_id, item.product_id, item.quantity, item.price]
+                    );
+                    
+                    // DECREMENT stock and INCREMENT sold_count
+                    await client.query(
+                        `UPDATE products 
+                         SET stock = stock - $1, 
+                             sold_count = sold_count + $1,
+                             updated_at = CURRENT_TIMESTAMP
+                         WHERE product_id = $2`,
+                        [item.quantity, item.product_id]
                     );
                 }
                 
@@ -274,6 +311,8 @@ const cartModel = {
             );
             
             await client.query('COMMIT');
+            
+            console.log('Checkout completed successfully. Orders created:', orders.length);
             
             return {
                 success: true,
