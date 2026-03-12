@@ -155,7 +155,7 @@ const cartModel = {
         return true;
     },
 
-    // Checkout - FIXED to use correct farmer_id from products table
+    // Checkout - FIXED to use correct farmer_id from products table and auto-update status
     async checkout(userId, orderDetails) {
         const client = await pool.connect();
         
@@ -181,7 +181,7 @@ const cartModel = {
                     ci.product_id,
                     ci.quantity,
                     p.price,
-                    p.farmer_id,  -- This is the farmer_id from products table (links to farmers table)
+                    p.farmer_id,
                     p.product_name,
                     p.stock,
                     p.unit
@@ -214,7 +214,7 @@ const cartModel = {
             // Group items by farmer (using farmer_id from products table)
             const farmerOrders = {};
             for (const item of cartItems.rows) {
-                const farmerId = item.farmer_id; // This comes from products table
+                const farmerId = item.farmer_id;
                 
                 if (!farmerOrders[farmerId]) {
                     farmerOrders[farmerId] = {
@@ -243,7 +243,7 @@ const cartModel = {
                     `INSERT INTO orders (
                         customer_id,
                         customer_name,
-                        farmer_id,  -- This should be the farmer_id from farmers table, NOT user_id
+                        farmer_id,
                         total_amount,
                         address,
                         contact_number,
@@ -254,15 +254,15 @@ const cartModel = {
                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)
                     RETURNING order_id`,
                     [
-                        userId,                          // customer_id (from users table)
-                        customerName,                    // customer_name
-                        parseInt(farmerId),              // farmer_id (from farmers table, NOT user_id)
-                        farmer_total,                     // total_amount
-                        orderDetails.address || null,    // address
-                        orderDetails.contact_number || null, // contact_number
-                        delivery_option,                  // delivery_option
-                        orderDetails.payment_method || 'COD', // payment_method
-                        'PENDING'                          // order_status
+                        userId,
+                        customerName,
+                        parseInt(farmerId),
+                        farmer_total,
+                        orderDetails.address || null,
+                        orderDetails.contact_number || null,
+                        delivery_option,
+                        orderDetails.payment_method || 'COD',
+                        'PENDING'
                     ]
                 );
                 
@@ -278,14 +278,30 @@ const cartModel = {
                     );
                     
                     // DECREMENT stock and INCREMENT sold_count
-                    await client.query(
+                    const updateResult = await client.query(
                         `UPDATE products 
                          SET stock = stock - $1, 
                              sold_count = sold_count + $1,
                              updated_at = CURRENT_TIMESTAMP
-                         WHERE product_id = $2`,
+                         WHERE product_id = $2
+                         RETURNING stock`,
                         [item.quantity, item.product_id]
                     );
+                    
+                    // Check if stock reached zero after decrement
+                    const newStock = updateResult.rows[0].stock;
+                    
+                    // If stock is now 0, update product status to UNAVAILABLE
+                    if (newStock === 0) {
+                        await client.query(
+                            `UPDATE products 
+                             SET status = 'UNAVAILABLE',
+                                 updated_at = CURRENT_TIMESTAMP
+                             WHERE product_id = $1`,
+                            [item.product_id]
+                        );
+                        console.log(`✅ Product ${item.product_id} (${item.product_name}) is now out of stock - status set to UNAVAILABLE`);
+                    }
                 }
                 
                 orders.push({

@@ -2,26 +2,21 @@
 const db = require('../config/database');
 
 const orderController = {
-    // Get farmer's orders - FIXED to handle farmer_id correctly
+    // Get farmer's orders - FIXED for your database structure
     async getFarmerOrders(req, res) {
         try {
             console.log('Getting farmer orders...');
             console.log('User object:', req.user);
             
-            // Get farmer_id from different possible locations
             let farmerId = null;
             
-            // Check different places where farmer_id might be
             if (req.user.farmer_id) {
                 farmerId = req.user.farmer_id;
             } else if (req.user.user && req.user.user.farmer_id) {
                 farmerId = req.user.user.farmer_id;
             } else if (req.user.user_id) {
-                // If we have user_id but no farmer_id, try to get it from database
                 console.log('No farmer_id in token, fetching from database for user_id:', req.user.user_id);
                 
-                // You need to query the farmers table to get farmer_id
-                // This depends on your database structure
                 const farmerResult = await db.query(
                     'SELECT farmer_id FROM farmers WHERE user_id = $1',
                     [req.user.user_id]
@@ -43,6 +38,7 @@ const orderController = {
             
             console.log('Using farmer_id:', farmerId);
             
+            // FIXED: Removed references to created_at and updated_at
             const query = `
                 SELECT 
                     o.order_id,
@@ -71,7 +67,8 @@ const orderController = {
                 LEFT JOIN order_items oi ON o.order_id = oi.order_id
                 LEFT JOIN products p ON oi.product_id = p.product_id
                 WHERE o.farmer_id = $1
-                GROUP BY o.order_id
+                GROUP BY o.order_id, o.customer_name, o.total_amount, o.order_status, o.order_date, 
+                         o.address, o.contact_number, o.delivery_option, o.payment_method
                 ORDER BY o.order_date DESC
             `;
             
@@ -94,7 +91,7 @@ const orderController = {
         }
     },
 
-    // Get customer's orders
+    // Get customer's orders - FIXED for your database structure
     async getCustomerOrders(req, res) {
         try {
             const userId = req.user.user_id;
@@ -127,7 +124,8 @@ const orderController = {
                 LEFT JOIN order_items oi ON o.order_id = oi.order_id
                 LEFT JOIN products p ON oi.product_id = p.product_id
                 WHERE o.customer_id = $1
-                GROUP BY o.order_id
+                GROUP BY o.order_id, o.customer_name, o.total_amount, o.order_status, o.order_date, 
+                         o.address, o.contact_number, o.delivery_option, o.payment_method
                 ORDER BY o.order_date DESC
             `;
             
@@ -148,7 +146,7 @@ const orderController = {
         }
     },
 
-    // Get order by ID
+    // Get order by ID - FIXED for your database structure
     async getOrderById(req, res) {
         try {
             const { id } = req.params;
@@ -157,7 +155,17 @@ const orderController = {
             
             let query = `
                 SELECT 
-                    o.*,
+                    o.order_id,
+                    o.customer_id,
+                    o.farmer_id,
+                    o.customer_name,
+                    o.total_amount,
+                    o.order_status,
+                    o.order_date,
+                    o.address,
+                    o.contact_number,
+                    o.delivery_option,
+                    o.payment_method,
                     COALESCE(
                         json_agg(
                             json_build_object(
@@ -182,14 +190,10 @@ const orderController = {
             
             // Add role-based filtering
             if (userRole === 'FARMER') {
-                // For farmers, we need to get their farmer_id
                 let farmerId = null;
                 if (req.user.farmer_id) {
                     farmerId = req.user.farmer_id;
-                } else if (req.user.user && req.user.user.farmer_id) {
-                    farmerId = req.user.user.farmer_id;
                 } else {
-                    // Try to get from database
                     const farmerResult = await db.query(
                         'SELECT farmer_id FROM farmers WHERE user_id = $1',
                         [userId]
@@ -210,7 +214,9 @@ const orderController = {
                 paramIndex++;
             }
             
-            query += ` GROUP BY o.order_id`;
+            query += ` GROUP BY o.order_id, o.customer_id, o.farmer_id, o.customer_name, o.total_amount, 
+                              o.order_status, o.order_date, o.address, o.contact_number, 
+                              o.delivery_option, o.payment_method`;
             
             const result = await db.query(query, values);
             
@@ -235,7 +241,7 @@ const orderController = {
         }
     },
 
-    // Update order status - Handles stock on cancellation
+    // Update order status - FIXED for your database structure
     async updateOrderStatus(req, res) {
         const client = await db.pool.connect();
         
@@ -247,7 +253,6 @@ const orderController = {
             const userId = req.user.user_id;
             const userRole = req.user.role;
             
-            // Valid statuses
             const validStatuses = ['PENDING', 'CONFIRMED', 'IN_TRANSIT', 'DELIVERED', 'CANCELLED'];
             if (!validStatuses.includes(status)) {
                 return res.status(400).json({
@@ -256,7 +261,6 @@ const orderController = {
                 });
             }
             
-            // Get current order status and farmer_id
             const orderQuery = await client.query(
                 'SELECT order_status, farmer_id, customer_id FROM orders WHERE order_id = $1',
                 [id]
@@ -269,9 +273,7 @@ const orderController = {
             const order = orderQuery.rows[0];
             const currentStatus = order.order_status;
             
-            // Check authorization for farmers
             if (userRole === 'FARMER') {
-                // Get farmer_id for this user
                 let farmerId = null;
                 if (req.user.farmer_id) {
                     farmerId = req.user.farmer_id;
@@ -292,31 +294,47 @@ const orderController = {
             
             // If cancelling an order that wasn't cancelled before, RESTORE STOCK
             if (status === 'CANCELLED' && currentStatus !== 'CANCELLED') {
-                // Get order items to restore stock
                 const itemsQuery = await client.query(
-                    `SELECT oi.product_id, oi.quantity 
+                    `SELECT oi.product_id, oi.quantity, p.product_name 
                      FROM order_items oi
+                     JOIN products p ON oi.product_id = p.product_id
                      WHERE oi.order_id = $1`,
                     [id]
                 );
                 
-                // Restore stock for each item
                 for (const item of itemsQuery.rows) {
                     await client.query(
                         `UPDATE products 
                          SET stock = stock + $1,
-                             sold_count = sold_count - $1,
-                             updated_at = CURRENT_TIMESTAMP
+                             sold_count = sold_count - $1
                          WHERE product_id = $2`,
                         [item.quantity, item.product_id]
                     );
+                    
+                    // Check if product should be AVAILABLE again
+                    const stockCheck = await client.query(
+                        'SELECT stock FROM products WHERE product_id = $1',
+                        [item.product_id]
+                    );
+                    
+                    const newStock = stockCheck.rows[0].stock;
+                    
+                    if (newStock > 0) {
+                        await client.query(
+                            `UPDATE products 
+                             SET status = 'AVAILABLE'
+                             WHERE product_id = $1 AND status = 'UNAVAILABLE'`,
+                            [item.product_id]
+                        );
+                        console.log(`✅ Product ${item.product_id} (${item.product_name}) is now back in stock - status set to AVAILABLE`);
+                    }
                 }
             }
             
-            // Update order status
+            // FIXED: Using only columns that exist in your database
             await client.query(
                 `UPDATE orders 
-                 SET order_status = $1, updated_at = CURRENT_TIMESTAMP
+                 SET order_status = $1
                  WHERE order_id = $2`,
                 [status, id]
             );
@@ -340,7 +358,7 @@ const orderController = {
         }
     },
 
-    // Cancel order (customer version) - RESTORES STOCK
+    // Cancel order (customer version) - FIXED for your database structure
     async cancelOrder(req, res) {
         const client = await db.pool.connect();
         
@@ -350,7 +368,6 @@ const orderController = {
             const { id } = req.params;
             const userId = req.user.user_id;
             
-            // Get order details
             const orderQuery = await client.query(
                 'SELECT order_status, customer_id FROM orders WHERE order_id = $1',
                 [id]
@@ -362,40 +379,54 @@ const orderController = {
             
             const order = orderQuery.rows[0];
             
-            // Check if order belongs to customer
             if (order.customer_id !== userId) {
                 throw new Error('Not authorized to cancel this order');
             }
             
-            // Check if order can be cancelled (only PENDING or CONFIRMED)
             if (!['PENDING', 'CONFIRMED'].includes(order.order_status)) {
                 throw new Error(`Cannot cancel order with status: ${order.order_status}`);
             }
             
-            // Get order items to restore stock
             const itemsQuery = await client.query(
-                `SELECT oi.product_id, oi.quantity 
+                `SELECT oi.product_id, oi.quantity, p.product_name 
                  FROM order_items oi
+                 JOIN products p ON oi.product_id = p.product_id
                  WHERE oi.order_id = $1`,
                 [id]
             );
             
-            // Restore stock for each item
             for (const item of itemsQuery.rows) {
                 await client.query(
                     `UPDATE products 
                      SET stock = stock + $1,
-                         sold_count = sold_count - $1,
-                         updated_at = CURRENT_TIMESTAMP
+                         sold_count = sold_count - $1
                      WHERE product_id = $2`,
                     [item.quantity, item.product_id]
                 );
+                
+                // Check if product should be AVAILABLE again
+                const stockCheck = await client.query(
+                    'SELECT stock FROM products WHERE product_id = $1',
+                    [item.product_id]
+                );
+                
+                const newStock = stockCheck.rows[0].stock;
+                
+                if (newStock > 0) {
+                    await client.query(
+                        `UPDATE products 
+                         SET status = 'AVAILABLE'
+                         WHERE product_id = $1 AND status = 'UNAVAILABLE'`,
+                        [item.product_id]
+                    );
+                    console.log(`✅ Product ${item.product_id} (${item.product_name}) is now back in stock - status set to AVAILABLE`);
+                }
             }
             
-            // Update order status to CANCELLED
+            // FIXED: Using only columns that exist in your database
             await client.query(
                 `UPDATE orders 
-                 SET order_status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP
+                 SET order_status = 'CANCELLED'
                  WHERE order_id = $1`,
                 [id]
             );
