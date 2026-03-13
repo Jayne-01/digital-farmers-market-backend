@@ -206,6 +206,186 @@ router.get('/seasonal', async (req, res) => {
     }
 });
 
+// NEW: GET /api/recommendations/personalized - Customer personalized recommendations
+router.get('/personalized', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        if (!userId) {
+            return res.status(401).json({ 
+                success: false, 
+                error: 'User ID not found in token' 
+            });
+        }
+
+        // Get user's recently viewed products
+        const viewedQuery = `
+            SELECT 
+                p.product_id,
+                p.product_name,
+                p.price,
+                p.description,
+                p.image_url,
+                p.category,
+                p.farmer_id,
+                f.farm_name,
+                f.farm_location,
+                pv.viewed_at
+            FROM product_views pv
+            JOIN products p ON pv.product_id = p.product_id
+            JOIN farmers f ON p.farmer_id = f.farmer_id
+            WHERE pv.user_id = $1
+            ORDER BY pv.viewed_at DESC
+            LIMIT 8
+        `;
+        
+        // Get similar products based on viewed categories and user preferences
+        const similarQuery = `
+            SELECT 
+                p.product_id,
+                p.product_name,
+                p.price,
+                p.description,
+                p.image_url,
+                p.category,
+                p.farmer_id,
+                f.farm_name,
+                f.farm_location,
+                COALESCE(p.view_count, 0) as popularity_score,
+                CASE 
+                    WHEN p.product_id IN (
+                        SELECT product_id FROM order_items oi
+                        JOIN orders o ON oi.order_id = o.order_id
+                        WHERE o.user_id = $1
+                    ) THEN 1 ELSE 0 
+                END as purchased_before
+            FROM products p
+            JOIN farmers f ON p.farmer_id = f.farmer_id
+            WHERE p.status = 'AVAILABLE'
+            AND p.category IN (
+                SELECT DISTINCT category 
+                FROM product_views pv
+                JOIN products p ON pv.product_id = p.product_id
+                WHERE pv.user_id = $1
+                UNION
+                SELECT DISTINCT p.category
+                FROM order_items oi
+                JOIN orders o ON oi.order_id = o.order_id
+                JOIN products p ON oi.product_id = p.product_id
+                WHERE o.user_id = $1 AND o.order_status = 'DELIVERED'
+            )
+            AND p.product_id NOT IN (
+                SELECT product_id FROM product_views WHERE user_id = $1
+            )
+            ORDER BY 
+                purchased_before DESC,
+                popularity_score DESC,
+                RANDOM()
+            LIMIT 8
+        `;
+        
+        // Get trending products (high views/purchases in last 7 days)
+        const trendingQuery = `
+            SELECT 
+                p.product_id,
+                p.product_name,
+                p.price,
+                p.description,
+                p.image_url,
+                p.category,
+                p.farmer_id,
+                f.farm_name,
+                f.farm_location,
+                COUNT(DISTINCT pv.view_id) as recent_views,
+                COUNT(DISTINCT oi.order_item_id) as recent_purchases
+            FROM products p
+            JOIN farmers f ON p.farmer_id = f.farmer_id
+            LEFT JOIN product_views pv ON p.product_id = pv.product_id 
+                AND pv.viewed_at > CURRENT_DATE - INTERVAL '7 days'
+            LEFT JOIN order_items oi ON p.product_id = oi.product_id
+            LEFT JOIN orders o ON oi.order_id = o.order_id
+                AND o.order_date > CURRENT_DATE - INTERVAL '7 days'
+                AND o.order_status IN ('COMPLETED', 'DELIVERED')
+            WHERE p.status = 'AVAILABLE'
+            GROUP BY p.product_id, f.farm_name, f.farm_location
+            HAVING COUNT(DISTINCT pv.view_id) > 0 OR COUNT(DISTINCT oi.order_item_id) > 0
+            ORDER BY (COUNT(DISTINCT pv.view_id) * 0.4 + COUNT(DISTINCT oi.order_item_id) * 0.6) DESC
+            LIMIT 8
+        `;
+
+        // Get also bought products (based on order history)
+        const alsoBoughtQuery = `
+            WITH user_orders AS (
+                SELECT DISTINCT order_id 
+                FROM orders 
+                WHERE user_id = $1 AND order_status = 'DELIVERED'
+            ),
+            user_products AS (
+                SELECT DISTINCT oi.product_id
+                FROM order_items oi
+                JOIN user_orders uo ON oi.order_id = uo.order_id
+            ),
+            also_bought AS (
+                SELECT 
+                    oi2.product_id,
+                    COUNT(*) as times_bought_together
+                FROM user_products up
+                JOIN order_items oi1 ON up.product_id = oi1.product_id
+                JOIN order_items oi2 ON oi1.order_id = oi2.order_id 
+                    AND oi2.product_id != up.product_id
+                GROUP BY oi2.product_id
+                ORDER BY times_bought_together DESC
+                LIMIT 8
+            )
+            SELECT 
+                p.product_id,
+                p.product_name,
+                p.price,
+                p.description,
+                p.image_url,
+                p.category,
+                p.farmer_id,
+                f.farm_name,
+                f.farm_location,
+                ab.times_bought_together
+            FROM also_bought ab
+            JOIN products p ON ab.product_id = p.product_id
+            JOIN farmers f ON p.farmer_id = f.farmer_id
+            WHERE p.status = 'AVAILABLE'
+            ORDER BY ab.times_bought_together DESC
+        `;
+
+        // Execute all queries in parallel
+        const [viewedResult, similarResult, trendingResult, alsoBoughtResult] = await Promise.all([
+            pool.query(viewedQuery, [userId]),
+            pool.query(similarQuery, [userId]),
+            pool.query(trendingQuery),
+            pool.query(alsoBoughtQuery, [userId])
+        ]);
+
+        res.json({
+            success: true,
+            recommendations: {
+                recently_viewed: viewedResult.rows,
+                similar_products: similarResult.rows,
+                trending_products: trendingResult.rows,
+                frequently_bought_together: alsoBoughtResult.rows
+            },
+            metadata: {
+                user_id: userId,
+                generated_at: new Date().toISOString()
+            }
+        });
+
+    } catch (error) {
+        console.error('Personalized recommendations error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
 // POST /api/recommendations/retrain - Admin only
 router.post('/retrain', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {

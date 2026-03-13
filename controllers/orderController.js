@@ -1,8 +1,40 @@
 // controllers/orderController.js
 const db = require('../config/database');
+const NotificationModel = require('../models/notificationModel');
+
+// Helper function to send order status notifications to customers only
+async function sendOrderStatusNotification(userId, orderId, oldStatus, newStatus) {
+    try {
+        // Define status messages for customers
+        const statusMessages = {
+            'PENDING': 'Your order is pending confirmation',
+            'CONFIRMED': 'Your order has been confirmed by the farmer',
+            'IN_TRANSIT': 'Your order is on the way to you',
+            'DELIVERED': 'Your order has been delivered',
+            'CANCELLED': 'Your order has been cancelled'
+        };
+
+        // Only send notification if status actually changed
+        if (oldStatus !== newStatus) {
+            const message = statusMessages[newStatus] || `Your order status has been updated to ${newStatus}`;
+            
+            // Create notification using your model
+            await NotificationModel.create(
+                userId,           // customer user_id
+                orderId,          // order_id
+                message           // message
+            );
+            
+            console.log(`✅ Notification sent to customer ${userId} for order ${orderId}: ${message}`);
+        }
+    } catch (error) {
+        console.error('❌ Error sending notification:', error);
+        // Don't throw error - notification failure shouldn't break the order update
+    }
+}
 
 const orderController = {
-    // Get farmer's orders - FIXED for your database structure
+    // Get farmer's orders
     async getFarmerOrders(req, res) {
         try {
             console.log('Getting farmer orders...');
@@ -38,7 +70,6 @@ const orderController = {
             
             console.log('Using farmer_id:', farmerId);
             
-            // FIXED: Removed references to created_at and updated_at
             const query = `
                 SELECT 
                     o.order_id,
@@ -91,7 +122,7 @@ const orderController = {
         }
     },
 
-    // Get customer's orders - FIXED for your database structure
+    // Get customer's orders
     async getCustomerOrders(req, res) {
         try {
             const userId = req.user.user_id;
@@ -146,7 +177,7 @@ const orderController = {
         }
     },
 
-    // Get order by ID - FIXED for your database structure
+    // Get order by ID
     async getOrderById(req, res) {
         try {
             const { id } = req.params;
@@ -241,7 +272,7 @@ const orderController = {
         }
     },
 
-    // Update order status - FIXED for your database structure
+    // Update order status (for farmers) - UPDATED WITH NOTIFICATIONS
     async updateOrderStatus(req, res) {
         const client = await db.pool.connect();
         
@@ -261,6 +292,7 @@ const orderController = {
                 });
             }
             
+            // Get order details with customer_id and current status
             const orderQuery = await client.query(
                 'SELECT order_status, farmer_id, customer_id FROM orders WHERE order_id = $1',
                 [id]
@@ -272,7 +304,9 @@ const orderController = {
             
             const order = orderQuery.rows[0];
             const currentStatus = order.order_status;
+            const customerId = order.customer_id;
             
+            // Check authorization for farmers
             if (userRole === 'FARMER') {
                 let farmerId = null;
                 if (req.user.farmer_id) {
@@ -303,6 +337,7 @@ const orderController = {
                 );
                 
                 for (const item of itemsQuery.rows) {
+                    // Restore stock
                     await client.query(
                         `UPDATE products 
                          SET stock = stock + $1,
@@ -331,7 +366,7 @@ const orderController = {
                 }
             }
             
-            // FIXED: Using only columns that exist in your database
+            // Update order status
             await client.query(
                 `UPDATE orders 
                  SET order_status = $1
@@ -340,6 +375,9 @@ const orderController = {
             );
             
             await client.query('COMMIT');
+            
+            // Send notification to customer about status change
+            await sendOrderStatusNotification(customerId, id, currentStatus, status);
             
             res.json({
                 success: true,
@@ -358,7 +396,7 @@ const orderController = {
         }
     },
 
-    // Cancel order (customer version) - FIXED for your database structure
+    // Cancel order (for customers) - UPDATED WITH NOTIFICATIONS
     async cancelOrder(req, res) {
         const client = await db.pool.connect();
         
@@ -366,10 +404,14 @@ const orderController = {
             await client.query('BEGIN');
             
             const { id } = req.params;
+            const { reason } = req.body; // Optional cancellation reason
             const userId = req.user.user_id;
             
+            console.log(`Customer ${userId} attempting to cancel order ${id}`);
+            
+            // Get order details
             const orderQuery = await client.query(
-                'SELECT order_status, customer_id FROM orders WHERE order_id = $1',
+                'SELECT order_status, customer_id, farmer_id, total_amount FROM orders WHERE order_id = $1',
                 [id]
             );
             
@@ -378,15 +420,19 @@ const orderController = {
             }
             
             const order = orderQuery.rows[0];
+            const currentStatus = order.order_status;
             
+            // Check if order belongs to this customer
             if (order.customer_id !== userId) {
                 throw new Error('Not authorized to cancel this order');
             }
             
-            if (!['PENDING', 'CONFIRMED'].includes(order.order_status)) {
-                throw new Error(`Cannot cancel order with status: ${order.order_status}`);
+            // UPDATED: Only allow cancellation if order status is PENDING
+            if (order.order_status !== 'PENDING') {
+                throw new Error(`Cannot cancel order with status: ${order.order_status}. Only PENDING orders can be cancelled.`);
             }
             
+            // Get order items to restore stock
             const itemsQuery = await client.query(
                 `SELECT oi.product_id, oi.quantity, p.product_name 
                  FROM order_items oi
@@ -395,7 +441,9 @@ const orderController = {
                 [id]
             );
             
+            // Restore stock for each item
             for (const item of itemsQuery.rows) {
+                // Restore stock
                 await client.query(
                     `UPDATE products 
                      SET stock = stock + $1,
@@ -423,7 +471,7 @@ const orderController = {
                 }
             }
             
-            // FIXED: Using only columns that exist in your database
+            // Update order status to CANCELLED
             await client.query(
                 `UPDATE orders 
                  SET order_status = 'CANCELLED'
@@ -433,14 +481,195 @@ const orderController = {
             
             await client.query('COMMIT');
             
+            // Send notification about cancellation (to the same user)
+            await sendOrderStatusNotification(userId, id, currentStatus, 'CANCELLED');
+            
+            console.log(`✅ Order ${id} cancelled successfully by customer ${userId}`);
+            if (reason) {
+                console.log(`   Cancellation reason: ${reason}`);
+            }
+            
             res.json({
                 success: true,
-                message: 'Order cancelled successfully'
+                message: 'Order cancelled successfully',
+                order_id: parseInt(id),
+                status: 'CANCELLED'
             });
             
         } catch (error) {
             await client.query('ROLLBACK');
             console.error('Cancel order error:', error);
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        } finally {
+            client.release();
+        }
+    },
+
+    // Get order statistics for dashboard
+    async getOrderStats(req, res) {
+        try {
+            const userId = req.user.user_id;
+            const userRole = req.user.role;
+            
+            let query = '';
+            let values = [];
+            
+            if (userRole === 'FARMER') {
+                // Get farmer_id
+                let farmerId = null;
+                if (req.user.farmer_id) {
+                    farmerId = req.user.farmer_id;
+                } else {
+                    const farmerResult = await db.query(
+                        'SELECT farmer_id FROM farmers WHERE user_id = $1',
+                        [userId]
+                    );
+                    if (farmerResult.rows.length > 0) {
+                        farmerId = farmerResult.rows[0].farmer_id;
+                    }
+                }
+                
+                if (!farmerId) {
+                    return res.status(400).json({
+                        success: false,
+                        error: 'Farmer ID not found'
+                    });
+                }
+                
+                query = `
+                    SELECT 
+                        COUNT(*) as total_orders,
+                        COUNT(CASE WHEN order_status = 'PENDING' THEN 1 END) as pending_count,
+                        COUNT(CASE WHEN order_status = 'CONFIRMED' THEN 1 END) as confirmed_count,
+                        COUNT(CASE WHEN order_status = 'IN_TRANSIT' THEN 1 END) as in_transit_count,
+                        COUNT(CASE WHEN order_status = 'DELIVERED' THEN 1 END) as delivered_count,
+                        COUNT(CASE WHEN order_status = 'CANCELLED' THEN 1 END) as cancelled_count,
+                        COALESCE(SUM(CASE WHEN order_status = 'DELIVERED' THEN total_amount ELSE 0 END), 0) as total_revenue
+                    FROM orders
+                    WHERE farmer_id = $1
+                `;
+                values = [farmerId];
+                
+            } else {
+                query = `
+                    SELECT 
+                        COUNT(*) as total_orders,
+                        COUNT(CASE WHEN order_status = 'PENDING' THEN 1 END) as pending_count,
+                        COUNT(CASE WHEN order_status = 'CONFIRMED' THEN 1 END) as confirmed_count,
+                        COUNT(CASE WHEN order_status = 'IN_TRANSIT' THEN 1 END) as in_transit_count,
+                        COUNT(CASE WHEN order_status = 'DELIVERED' THEN 1 END) as delivered_count,
+                        COUNT(CASE WHEN order_status = 'CANCELLED' THEN 1 END) as cancelled_count,
+                        COALESCE(SUM(CASE WHEN order_status = 'DELIVERED' THEN total_amount ELSE 0 END), 0) as total_spent
+                    FROM orders
+                    WHERE customer_id = $1
+                `;
+                values = [userId];
+            }
+            
+            const result = await db.query(query, values);
+            
+            res.json({
+                success: true,
+                stats: result.rows[0]
+            });
+            
+        } catch (error) {
+            console.error('Get order stats error:', error);
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        }
+    },
+
+    // Optional: Bulk update order status (for farmers)
+    async bulkUpdateOrderStatus(req, res) {
+        const client = await db.pool.connect();
+        
+        try {
+            await client.query('BEGIN');
+            
+            const { orderIds, status } = req.body;
+            const userId = req.user.user_id;
+            
+            if (!orderIds || !orderIds.length || !status) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Order IDs and status are required'
+                });
+            }
+            
+            const validStatuses = ['PENDING', 'CONFIRMED', 'IN_TRANSIT', 'DELIVERED', 'CANCELLED'];
+            if (!validStatuses.includes(status)) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Invalid status'
+                });
+            }
+            
+            // Get farmer_id
+            let farmerId = null;
+            if (req.user.farmer_id) {
+                farmerId = req.user.farmer_id;
+            } else {
+                const farmerResult = await client.query(
+                    'SELECT farmer_id FROM farmers WHERE user_id = $1',
+                    [userId]
+                );
+                if (farmerResult.rows.length > 0) {
+                    farmerId = farmerResult.rows[0].farmer_id;
+                }
+            }
+            
+            if (!farmerId) {
+                throw new Error('Farmer ID not found');
+            }
+            
+            // Get all orders with their current status and customer_ids
+            const getOrdersQuery = `
+                SELECT order_id, order_status, customer_id
+                FROM orders
+                WHERE order_id = ANY($1::int[]) AND farmer_id = $2
+            `;
+            
+            const ordersResult = await client.query(getOrdersQuery, [orderIds, farmerId]);
+            const orders = ordersResult.rows;
+            
+            if (orders.length === 0) {
+                throw new Error('No valid orders found');
+            }
+            
+            // Update all orders
+            const updateQuery = `
+                UPDATE orders 
+                SET order_status = $1
+                WHERE order_id = ANY($2::int[])
+                RETURNING order_id, customer_id
+            `;
+            
+            const result = await client.query(updateQuery, [status, orderIds]);
+            
+            await client.query('COMMIT');
+            
+            // Send notifications for each updated order
+            for (const order of orders) {
+                if (order.order_status !== status) { // Only if status changed
+                    await sendOrderStatusNotification(order.customer_id, order.order_id, order.order_status, status);
+                }
+            }
+            
+            res.json({
+                success: true,
+                message: `${result.rowCount} orders updated successfully`,
+                orders: result.rows
+            });
+            
+        } catch (error) {
+            await client.query('ROLLBACK');
+            console.error('Bulk update order status error:', error);
             res.status(500).json({
                 success: false,
                 error: error.message

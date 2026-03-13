@@ -1,6 +1,7 @@
 // controllers/productController.js
 const db = require('../config/database');
 const Farmer = require('../models/farmerModel');
+const Product = require('../models/productModel');
 
 console.log('✅ Product controller loaded');
 
@@ -56,57 +57,24 @@ const getFarmerProducts = async (req, res) => {
     }
 };
 
-// Get all products (public)
+// Get all products (public) - UPDATED WITH RATINGS
 const getAllProducts = async (req, res) => {
     try {
-        const { category, minPrice, maxPrice, sort, page = 1, limit = 12 } = req.query;
+        const { category, barangay, minPrice, maxPrice, sort, page = 1, limit = 12 } = req.query;
         
-        let query = `
-            SELECT p.*, f.farm_name, f.barangay,
-                   CASE WHEN p.stock > 0 THEN true ELSE false END as in_stock
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            WHERE p.status = 'AVAILABLE'
-        `;
-        const values = [];
-        let paramIndex = 1;
-
-        if (category) {
-            query += ` AND p.category = $${paramIndex++}`;
-            values.push(category);
-        }
-
-        if (minPrice) {
-            query += ` AND p.price >= $${paramIndex++}`;
-            values.push(minPrice);
-        }
-
-        if (maxPrice) {
-            query += ` AND p.price <= $${paramIndex++}`;
-            values.push(maxPrice);
-        }
-
-        // Add sorting
-        switch (sort) {
-            case 'price_low':
-                query += ' ORDER BY p.price ASC';
-                break;
-            case 'price_high':
-                query += ' ORDER BY p.price DESC';
-                break;
-            case 'popular':
-                query += ' ORDER BY p.sold_count DESC NULLS LAST';
-                break;
-            default:
-                query += ' ORDER BY p.created_at DESC';
-        }
-
-        // Add pagination
         const offset = (page - 1) * limit;
-        query += ` LIMIT $${paramIndex++} OFFSET $${paramIndex++}`;
-        values.push(limit, offset);
-
-        const result = await db.query(query, values);
+        
+        const filters = {
+            category,
+            barangay,
+            minPrice,
+            maxPrice,
+            sortBy: sort,
+            limit: parseInt(limit),
+            offset: parseInt(offset)
+        };
+        
+        const result = await Product.getProductsWithRatings(filters);
         
         // Get total count for pagination
         const countQuery = 'SELECT COUNT(*) FROM products WHERE status = $1';
@@ -133,10 +101,10 @@ const getAllProducts = async (req, res) => {
     }
 };
 
-// Search products (public)
+// Search products (public) - UPDATED WITH RATINGS
 const searchProducts = async (req, res) => {
     try {
-        const { query: searchQuery } = req.query;
+        const { query: searchQuery, category, minPrice, maxPrice } = req.query;
         
         if (!searchQuery) {
             return res.status(400).json({ 
@@ -145,17 +113,14 @@ const searchProducts = async (req, res) => {
             });
         }
 
-        const sql = `
-            SELECT p.*, f.farm_name, f.barangay,
-                   CASE WHEN p.stock > 0 THEN true ELSE false END as in_stock
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            WHERE p.status = 'AVAILABLE' 
-            AND (p.product_name ILIKE $1 OR p.description ILIKE $1 OR f.farm_name ILIKE $1)
-            ORDER BY p.created_at DESC
-        `;
-
-        const result = await db.query(sql, [`%${searchQuery}%`]);
+        const filters = {
+            category,
+            minPrice,
+            maxPrice,
+            limit: 20
+        };
+        
+        const result = await Product.searchProductsWithRatings(searchQuery, filters);
         
         res.json({
             success: true,
@@ -172,21 +137,17 @@ const searchProducts = async (req, res) => {
     }
 };
 
-// Get products by category (public)
+// Get products by category (public) - UPDATED WITH RATINGS
 const getProductsByCategory = async (req, res) => {
     try {
         const { category } = req.params;
         
-        const query = `
-            SELECT p.*, f.farm_name, f.barangay,
-                   CASE WHEN p.stock > 0 THEN true ELSE false END as in_stock
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            WHERE p.category = $1 AND p.status = 'AVAILABLE'
-            ORDER BY p.created_at DESC
-        `;
-
-        const result = await db.query(query, [category]);
+        const filters = {
+            category,
+            limit: 20
+        };
+        
+        const result = await Product.getProductsWithRatings(filters);
         
         res.json({
             success: true,
@@ -203,20 +164,12 @@ const getProductsByCategory = async (req, res) => {
     }
 };
 
-// Get product by ID (public)
+// Get product by ID (public) - UPDATED WITH RATINGS
 const getProductById = async (req, res) => {
     try {
         const { id } = req.params;
         
-        const query = `
-            SELECT p.*, f.farm_name, f.barangay, f.farmer_id,
-                   CASE WHEN p.stock > 0 THEN true ELSE false END as in_stock
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            WHERE p.product_id = $1
-        `;
-
-        const result = await db.query(query, [id]);
+        const result = await Product.findByIdWithRatings(id);
         
         if (result.rows.length === 0) {
             return res.status(404).json({ 
@@ -345,7 +298,7 @@ const updateProduct = async (req, res) => {
         const category = req.body.category;
         const price = req.body.price;
         const unit = req.body.unit;
-        const stock = req.body.stock; // ADDED STOCK
+        const stock = req.body.stock;
         const harvest_date = req.body.harvest_date;
         const description = req.body.description;
         const status = req.body.status;
@@ -355,7 +308,7 @@ const updateProduct = async (req, res) => {
             category,
             price,
             unit,
-            stock, // ADDED STOCK
+            stock,
             harvest_date,
             description,
             status
@@ -383,7 +336,6 @@ const updateProduct = async (req, res) => {
             updates.push(`unit = $${paramIndex++}`);
             values.push(unit);
         }
-        // FIXED: Added stock update block
         if (stock !== undefined) {
             console.log('Adding stock to update:', stock);
             // Validate stock is not negative

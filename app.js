@@ -16,6 +16,7 @@ const orderRoutes = require('./routes/orderRoutes');
 const recommendationRoutes = require('./routes/recommendationRoutes');
 const cartRoutes = require('./routes/cartRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
+const feedbackRoutes = require('./routes/feedbackRoutes');
 
 const app = express();
 
@@ -996,6 +997,13 @@ if (notificationRoutes) {
     console.error('❌ Notification routes failed to load');
 }
 
+if (feedbackRoutes) {
+    app.use('/api/feedback', feedbackRoutes);
+    console.log('✅ Feedback routes loaded successfully');
+} else {
+    console.error('❌ Feedback routes failed to load');
+}
+
 // ========== ERROR HANDLING ==========
 app.use((err, req, res, next) => {
     console.error('❌ Server error:', err.stack);
@@ -1036,7 +1044,9 @@ app.use('*', (req, res) => {
             'DELETE /api/cart/remove/:id',
             'DELETE /api/cart/clear',
             'POST /api/cart/checkout',
-            'GET /health'
+            'GET /health',
+            'GET /api/feedback',
+            'POST /api/feedback'
         ]
     });
 });

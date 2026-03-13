@@ -27,11 +27,15 @@ class Product {
 
     // Get all products by a specific farmer
     static async findByFarmer(farmer_id) {
-        const query = ` SELECT p.*, f.farm_name, u.full_name as farmer_name, u.contact_number, u.barangay
+        const query = ` SELECT p.*, f.farm_name, u.full_name as farmer_name, u.contact_number, u.barangay,
+            COALESCE(AVG(fb.rating), 0) as average_rating,
+            COUNT(DISTINCT fb.feedback_id) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
+            LEFT JOIN feedback fb ON p.product_id = fb.product_id
             WHERE p.farmer_id = $1
+            GROUP BY p.product_id, f.farm_name, u.full_name, u.contact_number, u.barangay
             ORDER BY 
                 CASE p.status 
                     WHEN 'AVAILABLE' THEN 1 
@@ -42,33 +46,48 @@ class Product {
         return await db.query(query, [farmer_id]);
     }
 
-    // Get product by ID with farmer details
+    // Get product by ID with farmer details and ratings
     static async findById(product_id) {
         const query = `
             SELECT 
                 p.*,
-                f.farm_name, f.verified_status, u.full_name as farmer_name, u.contact_number, u.email, u.barangay
+                f.farm_name, 
+                f.verified_status, 
+                u.full_name as farmer_name, 
+                u.contact_number, 
+                u.email, 
+                u.barangay,
+                COALESCE(AVG(fb.rating), 0) as average_rating,
+                COUNT(DISTINCT fb.feedback_id) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
+            LEFT JOIN feedback fb ON p.product_id = fb.product_id
             WHERE p.product_id = $1
+            GROUP BY p.product_id, f.farm_name, f.verified_status, u.full_name, u.contact_number, u.email, u.barangay
         `;
         return await db.query(query, [product_id]);
     }
 
-    // Get all products with filtering
+    // Get all products with filtering and ratings
     static async getAllProducts(filters = {}) {
         let query = `
             SELECT 
-                p.*, f.farm_name, u.full_name as farmer_name, u.barangay,
+                p.*, 
+                f.farm_name, 
+                u.full_name as farmer_name, 
+                u.barangay,
                 COALESCE((
                     SELECT COUNT(*) 
                     FROM product_views pv 
                     WHERE pv.product_id = p.product_id
-                ), 0) as view_count
+                ), 0) as view_count,
+                COALESCE(AVG(fb.rating), 0) as average_rating,
+                COUNT(DISTINCT fb.feedback_id) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
+            LEFT JOIN feedback fb ON p.product_id = fb.product_id
             WHERE 1=1
         `;
         
@@ -120,6 +139,9 @@ class Product {
         // Farmer verification filter (only show verified farmers' products)
         query += ` AND f.verified_status = true`;
 
+        // Group by for aggregation
+        query += ` GROUP BY p.product_id, f.farm_name, u.full_name, u.barangay`;
+
         // Sorting
         let orderBy = 'p.created_at DESC';
         if (filters.sortBy) {
@@ -142,6 +164,9 @@ class Product {
                 case 'popular':
                     orderBy = 'p.sold_count DESC';
                     break;
+                case 'top_rated':
+                    orderBy = 'average_rating DESC, review_count DESC';
+                    break;
                 default:
                     orderBy = 'p.created_at DESC';
             }
@@ -158,6 +183,91 @@ class Product {
                 query += ` OFFSET $${paramIndex}`;
                 values.push(parseInt(filters.offset));
             }
+        }
+
+        return await db.query(query, values);
+    }
+
+    // Get products with ratings (for public API)
+    static async getProductsWithRatings(filters = {}) {
+        return await this.getAllProducts(filters);
+    }
+
+    // Get product by ID with ratings (for public API)
+    static async findByIdWithRatings(product_id) {
+        return await this.findById(product_id);
+    }
+
+    // Search products with ratings
+    static async searchProductsWithRatings(searchTerm, filters = {}) {
+        let query = `
+            SELECT 
+                p.*,
+                f.farm_name,
+                u.full_name as farmer_name,
+                u.barangay,
+                COALESCE((
+                    SELECT COUNT(*) 
+                    FROM product_views pv 
+                    WHERE pv.product_id = p.product_id
+                ), 0) as view_count,
+                COALESCE(AVG(fb.rating), 0) as average_rating,
+                COUNT(DISTINCT fb.feedback_id) as review_count,
+                -- Calculate relevance score
+                CASE 
+                    WHEN p.product_name ILIKE $1 THEN 3
+                    WHEN p.description ILIKE $1 THEN 2
+                    WHEN p.category ILIKE $1 THEN 1
+                    ELSE 0
+                END as relevance_score
+            FROM products p
+            JOIN farmers f ON p.farmer_id = f.farmer_id
+            JOIN users u ON f.user_id = u.user_id
+            LEFT JOIN feedback fb ON p.product_id = fb.product_id
+            WHERE (
+                p.product_name ILIKE $1 
+                OR p.description ILIKE $1 
+                OR p.category ILIKE $1
+                OR f.farm_name ILIKE $1
+                OR u.barangay ILIKE $1
+            )
+            AND p.status = 'AVAILABLE'
+            AND p.stock > 0
+            AND f.verified_status = true
+        `;
+
+        const values = [`%${searchTerm}%`];
+        let paramIndex = 2;
+
+        // Additional filters
+        if (filters.category) {
+            query += ` AND p.category = $${paramIndex}`;
+            values.push(filters.category);
+            paramIndex++;
+        }
+
+        if (filters.minPrice) {
+            query += ` AND p.price >= $${paramIndex}`;
+            values.push(parseFloat(filters.minPrice));
+            paramIndex++;
+        }
+
+        if (filters.maxPrice) {
+            query += ` AND p.price <= $${paramIndex}`;
+            values.push(parseFloat(filters.maxPrice));
+            paramIndex++;
+        }
+
+        // Group by
+        query += ` GROUP BY p.product_id, f.farm_name, u.full_name, u.barangay`;
+
+        // Order by relevance then date
+        query += ` ORDER BY relevance_score DESC, p.created_at DESC`;
+
+        // Limit results
+        if (filters.limit) {
+            query += ` LIMIT $${paramIndex}`;
+            values.push(parseInt(filters.limit));
         }
 
         return await db.query(query, values);
@@ -290,11 +400,14 @@ class Product {
                 f.farm_name,
                 u.full_name as farmer_name,
                 u.barangay,
-                COUNT(pv.view_id) as view_count
+                COUNT(pv.view_id) as view_count,
+                COALESCE(AVG(fb.rating), 0) as average_rating,
+                COUNT(DISTINCT fb.feedback_id) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
             LEFT JOIN product_views pv ON p.product_id = pv.product_id
+            LEFT JOIN feedback fb ON p.product_id = fb.product_id
             WHERE p.status = 'AVAILABLE'
             AND p.stock > 0
             AND f.verified_status = true
@@ -312,12 +425,16 @@ class Product {
                 p.*,
                 f.farm_name,
                 u.full_name as farmer_name,
-                u.barangay
+                u.barangay,
+                COALESCE(AVG(fb.rating), 0) as average_rating,
+                COUNT(DISTINCT fb.feedback_id) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
+            LEFT JOIN feedback fb ON p.product_id = fb.product_id
             WHERE p.status = 'AVAILABLE'
             AND f.verified_status = true
+            GROUP BY p.product_id, f.farm_name, u.full_name, u.barangay
             ORDER BY p.sold_count DESC
             LIMIT $1
         `;
@@ -331,14 +448,18 @@ class Product {
                 p.*,
                 f.farm_name,
                 u.full_name as farmer_name,
-                u.barangay
+                u.barangay,
+                COALESCE(AVG(fb.rating), 0) as average_rating,
+                COUNT(DISTINCT fb.feedback_id) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
+            LEFT JOIN feedback fb ON p.product_id = fb.product_id
             WHERE p.category = $1
             AND p.status = 'AVAILABLE'
             AND p.stock > 0
             AND f.verified_status = true
+            GROUP BY p.product_id, f.farm_name, u.full_name, u.barangay
             ORDER BY p.created_at DESC
             LIMIT $2
         `;
@@ -347,71 +468,7 @@ class Product {
 
     // Search products
     static async searchProducts(searchTerm, filters = {}) {
-        let query = `
-            SELECT 
-                p.*,
-                f.farm_name,
-                u.full_name as farmer_name,
-                u.barangay,
-                (
-                    SELECT COUNT(*) 
-                    FROM product_views pv 
-                    WHERE pv.product_id = p.product_id
-                ) as view_count,
-                -- Calculate relevance score
-                CASE 
-                    WHEN p.product_name ILIKE $1 THEN 3
-                    WHEN p.description ILIKE $1 THEN 2
-                    WHEN p.category ILIKE $1 THEN 1
-                    ELSE 0
-                END as relevance_score
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            JOIN users u ON f.user_id = u.user_id
-            WHERE (
-                p.product_name ILIKE $1 
-                OR p.description ILIKE $1 
-                OR p.category ILIKE $1
-                OR f.farm_name ILIKE $1
-                OR u.barangay ILIKE $1
-            )
-            AND p.status = 'AVAILABLE'
-            AND p.stock > 0
-            AND f.verified_status = true
-        `;
-
-        const values = [`%${searchTerm}%`];
-        let paramIndex = 2;
-
-        // Additional filters
-        if (filters.category) {
-            query += ` AND p.category = $${paramIndex}`;
-            values.push(filters.category);
-            paramIndex++;
-        }
-
-        if (filters.minPrice) {
-            query += ` AND p.price >= $${paramIndex}`;
-            values.push(parseFloat(filters.minPrice));
-            paramIndex++;
-        }
-
-        if (filters.maxPrice) {
-            query += ` AND p.price <= $${paramIndex}`;
-            values.push(parseFloat(filters.maxPrice));
-            paramIndex++;
-        }
-
-        // Order by relevance then date
-        query += ` ORDER BY relevance_score DESC, p.created_at DESC`;
-
-        // Limit results
-        if (filters.limit) {
-            query += ` LIMIT $${paramIndex}`;
-            values.push(parseInt(filters.limit));
-        }
-
-        return await db.query(query, values);
+        return await this.searchProductsWithRatings(searchTerm, filters);
     }
 
     // Get product statistics for farmer dashboard
@@ -462,13 +519,17 @@ class Product {
                 p.*,
                 f.farm_name,
                 u.full_name as farmer_name,
-                u.barangay
+                u.barangay,
+                COALESCE(AVG(fb.rating), 0) as average_rating,
+                COUNT(DISTINCT fb.feedback_id) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
+            LEFT JOIN feedback fb ON p.product_id = fb.product_id
             WHERE p.status = 'AVAILABLE'
             AND p.stock > 0
             AND f.verified_status = true
+            GROUP BY p.product_id, f.farm_name, u.full_name, u.barangay
             ORDER BY p.created_at DESC
             LIMIT $1 OFFSET $2
         `;
