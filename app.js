@@ -8,7 +8,7 @@ const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 require('dotenv').config();
 
-//import routes
+// Import routes
 const productRoutes = require('./routes/productRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const farmerRoutes = require('./routes/farmerRoutes');
@@ -17,67 +17,203 @@ const recommendationRoutes = require('./routes/recommendationRoutes');
 const cartRoutes = require('./routes/cartRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const feedbackRoutes = require('./routes/feedbackRoutes');
+const classifyRoutes = require('./routes/classify');
 
 const app = express();
 
-// Database connection
+// Database connection with improved configuration
 const pool = new Pool({
     user: process.env.DB_USER || 'postgres',
     host: process.env.DB_HOST || 'localhost',
-    database: process.env.DB_NAME || 'digital_market',
-    password: process.env.DB_PASSWORD || 'password',
+    database: process.env.DB_NAME || 'Digital-Farm-Market',
+    password: process.env.DB_PASSWORD || '010124',
     port: process.env.DB_PORT || 5432,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000,
 });
 
 // Make db available to routes
 app.locals.db = pool;
 app.locals.pool = pool;
 
-// Serve static files from uploads directory
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// Test database connection with retry logic
+const connectWithRetry = async () => {
+    try {
+        await pool.connect();
+        console.log('✅ Connected to PostgreSQL database');
+        
+        const testResult = await pool.query('SELECT NOW() as current_time');
+        console.log(`   Database time: ${testResult.rows[0].current_time}`);
+    } catch (err) {
+        console.error('❌ Database connection error:', err.message);
+        console.log('🔄 Retrying in 5 seconds...');
+        setTimeout(connectWithRetry, 5000);
+    }
+};
 
-// Test database connection
-pool.connect()
-    .then(() => console.log('✅ Connected to PostgreSQL database'))
-    .catch(err => console.error('❌ Database connection error:', err));
+connectWithRetry();
+
+// Handle pool errors
+pool.on('error', (err) => {
+    console.error('Unexpected error on idle client', err);
+    process.exit(-1);
+});
 
 // Middleware
-app.use(helmet());
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+app.use(cors({
+    origin: ['http://localhost:3000', 'http://localhost:5000', 'http://127.0.0.1:3000'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(morgan('dev'));
-app.use('/uploads', express.static('uploads'));
+
+// Static files
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use(express.static('C:/Users/Jorinna/OneDrive/Desktop/digital-farmers-market-frontend'));
 
-// Request logging
+// Request logging middleware
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    const start = Date.now();
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
+    });
     next();
 });
 
-// Health check
+// Health check with more details
 app.get('/health', async (req, res) => {
     try {
-        await pool.query('SELECT 1');
+        const dbResult = await pool.query('SELECT 1 as alive');
+        const dbTime = await pool.query('SELECT NOW() as time');
+        
         res.status(200).json({ 
             status: 'OK',
             database: 'Connected',
-            timestamp: new Date().toISOString()
+            database_time: dbTime.rows[0].time,
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            memory: process.memoryUsage()
         });
     } catch (error) {
         res.status(500).json({ 
             status: 'ERROR',
             database: 'Disconnected',
-            error: error.message 
+            error: error.message,
+            timestamp: new Date().toISOString()
         });
     }
 });
 
-// ========== WORKING REGISTER ENDPOINT ==========
+// ========== AUTHENTICATION MIDDLEWARE ==========
+const authenticateToken = async (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+        const token = authHeader && authHeader.split(' ')[1];
+
+        if (!token) {
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Access token required' 
+            });
+        }
+
+        const decoded = jwt.verify(
+            token, 
+            process.env.JWT_SECRET || 'your-secret-key-change-in-production'
+        );
+
+        const userResult = await pool.query(
+            'SELECT user_id, role, status FROM users WHERE user_id = $1',
+            [decoded.user_id]
+        );
+
+        if (userResult.rows.length === 0) {
+            return res.status(401).json({ 
+                success: false, 
+                error: 'User no longer exists' 
+            });
+        }
+
+        if (userResult.rows[0].status !== 'ACTIVE') {
+            return res.status(403).json({ 
+                success: false, 
+                error: 'Account is deactivated' 
+            });
+        }
+
+        req.user = {
+            ...decoded,
+            ...userResult.rows[0],
+            id: decoded.user_id
+        };
+        
+        next();
+    } catch (error) {
+        if (error.name === 'JsonWebTokenError') {
+            return res.status(403).json({ 
+                success: false, 
+                error: 'Invalid token' 
+            });
+        }
+        if (error.name === 'TokenExpiredError') {
+            return res.status(403).json({ 
+                success: false, 
+                error: 'Token expired' 
+            });
+        }
+        console.error('Auth middleware error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Authentication error' 
+        });
+    }
+};
+
+// Role authorization middleware
+const authorizeRole = (roles) => {
+    return (req, res, next) => {
+        console.log('=== AUTHORIZE ROLE CALLED ===');
+        console.log('Roles passed:', roles);
+        console.log('User role from JWT:', req.user?.role);
+        
+        if (!req.user) {
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Unauthorized: No user data' 
+            });
+        }
+        
+        if (!roles.includes(req.user.role)) {
+            return res.status(403).json({ 
+                success: false, 
+                error: `Access denied. Required role: ${roles.join(' or ')}` 
+            });
+        }
+        
+        console.log('✅ Role check PASSED!');
+        next();
+    };
+};
+
+// ========== AUTH ENDPOINTS ==========
+
+/**
+ * @route   POST /api/auth/register
+ * @desc    Register a new customer
+ * @access  Public
+ */
 app.post('/api/auth/register', async (req, res) => {
-    console.log('🔥 Register endpoint called');
-    console.log('Request body:', req.body);
+    console.log('📝 Register endpoint called');
     
     try {
         const { 
@@ -90,12 +226,17 @@ app.post('/api/auth/register', async (req, res) => {
             barangay 
         } = req.body;
         
-        // Validation
-        if (!full_name || !email || !password) {
+        const validationErrors = [];
+        
+        if (!full_name) validationErrors.push('Full name is required');
+        if (!email) validationErrors.push('Email is required');
+        if (!password) validationErrors.push('Password is required');
+        
+        if (validationErrors.length > 0) {
             return res.status(400).json({ 
                 success: false,
-                error: 'Missing required fields',
-                required: ['full_name', 'email', 'password']
+                error: 'Validation failed',
+                details: validationErrors
             });
         }
         
@@ -146,8 +287,9 @@ app.post('/api/auth/register', async (req, res) => {
                 contact_number, 
                 address,
                 barangay,
+                status,
                 created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
             RETURNING user_id, full_name, email, role, contact_number, address, barangay, created_at`,
             [
                 full_name, 
@@ -156,7 +298,8 @@ app.post('/api/auth/register', async (req, res) => {
                 role, 
                 contact_number || null, 
                 address || null,
-                barangay || null
+                barangay || null,
+                'ACTIVE'
             ]
         );
         
@@ -206,9 +349,13 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-// ========== WORKING LOGIN ENDPOINT (UPDATED WITH FARMER_ID) ==========
+/**
+ * @route   POST /api/auth/login
+ * @desc    Login user
+ * @access  Public
+ */
 app.post('/api/auth/login', async (req, res) => {
-    console.log('🔥 Login endpoint called');
+    console.log('🔑 Login endpoint called');
     
     try {
         const { email, password } = req.body;
@@ -249,7 +396,6 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
         
-        // Get farmer_id if user is a farmer
         let farmer_id = null;
         if (user.role === 'FARMER') {
             const farmerResult = await pool.query(
@@ -265,7 +411,8 @@ app.post('/api/auth/login', async (req, res) => {
             { 
                 user_id: user.user_id, 
                 email: user.email, 
-                role: user.role 
+                role: user.role,
+                id: user.user_id
             },
             process.env.JWT_SECRET || 'your-secret-key-change-in-production',
             { expiresIn: '7d' }
@@ -273,7 +420,6 @@ app.post('/api/auth/login', async (req, res) => {
         
         delete user.password;
         
-        // Add farmer_id to user object
         user.farmer_id = farmer_id;
         
         console.log('✅ User logged in:', user.email);
@@ -296,30 +442,21 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// Get user profile (UPDATED WITH FARMER_ID)
-app.get('/api/auth/profile', async (req, res) => {
+/**
+ * @route   GET /api/auth/profile
+ * @desc    Get user profile
+ * @access  Private
+ */
+app.get('/api/auth/profile', authenticateToken, async (req, res) => {
     try {
-        const token = req.headers.authorization?.split(' ')[1];
-        
-        if (!token) {
-            return res.status(401).json({ 
-                success: false,
-                error: 'No token provided' 
-            });
-        }
-        
-        const decoded = jwt.verify(
-            token, 
-            process.env.JWT_SECRET || 'your-secret-key-change-in-production'
-        );
-        
         const result = await pool.query(
             `SELECT u.user_id, u.full_name, u.email, u.role, u.contact_number, 
-                    u.address, u.barangay, u.created_at, f.farmer_id
+                    u.address, u.barangay, u.status, u.created_at, u.updated_at,
+                    f.farmer_id, f.farm_name, f.verified_status
              FROM users u
              LEFT JOIN farmers f ON u.user_id = f.user_id
              WHERE u.user_id = $1`,
-            [decoded.user_id]
+            [req.user.user_id]
         );
         
         if (result.rows.length === 0) {
@@ -336,14 +473,6 @@ app.get('/api/auth/profile', async (req, res) => {
         
     } catch (error) {
         console.error('Profile error:', error);
-        
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ 
-                success: false,
-                error: 'Invalid token' 
-            });
-        }
-        
         res.status(500).json({
             success: false,
             error: 'Failed to get profile'
@@ -351,25 +480,15 @@ app.get('/api/auth/profile', async (req, res) => {
     }
 });
 
-// ========== UPDATE USER PROFILE ==========
-app.put('/api/auth/update-profile', async (req, res) => {
-    console.log('🔥 Update profile endpoint called');
+/**
+ * @route   PUT /api/auth/update-profile
+ * @desc    Update user profile
+ * @access  Private
+ */
+app.put('/api/auth/update-profile', authenticateToken, async (req, res) => {
+    console.log('📝 Update profile endpoint called');
     
     try {
-        const token = req.headers.authorization?.split(' ')[1];
-        
-        if (!token) {
-            return res.status(401).json({ 
-                success: false,
-                error: 'No token provided' 
-            });
-        }
-        
-        const decoded = jwt.verify(
-            token, 
-            process.env.JWT_SECRET || 'your-secret-key-change-in-production'
-        );
-        
         const { 
             full_name, 
             contact_number, 
@@ -413,7 +532,7 @@ app.put('/api/auth/update-profile', async (req, res) => {
         }
         
         updateFields.push(`updated_at = NOW()`);
-        values.push(decoded.user_id);
+        values.push(req.user.user_id);
         
         const result = await pool.query(
             `UPDATE users 
@@ -432,7 +551,6 @@ app.put('/api/auth/update-profile', async (req, res) => {
         
         const updatedUser = result.rows[0];
         
-        // Get farmer_id if user is a farmer
         if (updatedUser.role === 'FARMER') {
             const farmerResult = await pool.query(
                 'SELECT farmer_id FROM farmers WHERE user_id = $1',
@@ -469,23 +587,15 @@ app.put('/api/auth/update-profile', async (req, res) => {
     }
 });
 
-// ========== REGISTER AS FARMER (UPDATED TO RETURN FARMER_ID) ==========
-app.post('/api/auth/register-farmer', async (req, res) => {
-    console.log('🔥 FARMER REGISTRATION CALLED');
-    console.log('📦 Request body:', req.body);
+/**
+ * @route   POST /api/auth/register-farmer
+ * @desc    Register as a farmer
+ * @access  Private
+ */
+app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
+    console.log('🌾 Farmer registration called for user:', req.user.user_id);
 
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader) {
-            return res.status(401).json({
-                success: false,
-                error: 'No token provided'
-            });
-        }
-
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
-
         const { farm_name, farm_location, farm_description } = req.body;
 
         if (!farm_name) {
@@ -497,7 +607,7 @@ app.post('/api/auth/register-farmer', async (req, res) => {
 
         const existingFarmer = await pool.query(
             'SELECT farmer_id FROM farmers WHERE user_id = $1',
-            [decoded.user_id]
+            [req.user.user_id]
         );
 
         if (existingFarmer.rows.length > 0) {
@@ -508,56 +618,70 @@ app.post('/api/auth/register-farmer', async (req, res) => {
             });
         }
 
-        const result = await pool.query(
-            `INSERT INTO farmers (
-                user_id,
-                farm_name,
-                barangay,
-                farm_description,
-                verified_status,
-                created_at
-            )
-            VALUES ($1, $2, $3, $4, $5, NOW())
-            RETURNING
-                farmer_id,
-                farm_name,
-                barangay,
-                farm_description,
-                verified_status,
-                created_at`,
-            [
-                decoded.user_id,
-                farm_name,
-                farm_location || null,
-                farm_description || null,
-                false
-            ]
-        );
+        const client = await pool.connect();
+        
+        try {
+            await client.query('BEGIN');
+            
+            const result = await client.query(
+                `INSERT INTO farmers (
+                    user_id,
+                    farm_name,
+                    barangay,
+                    farm_description,
+                    verified_status,
+                    created_at
+                )
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                RETURNING
+                    farmer_id,
+                    farm_name,
+                    barangay,
+                    farm_description,
+                    verified_status,
+                    created_at`,
+                [
+                    req.user.user_id,
+                    farm_name,
+                    farm_location || null,
+                    farm_description || null,
+                    false
+                ]
+            );
 
-        console.log('✅ Farmer inserted successfully!');
-        console.log('   - Farmer ID:', result.rows[0].farmer_id);
+            await client.query(
+                'UPDATE users SET role = $1, updated_at = NOW() WHERE user_id = $2',
+                ['FARMER', req.user.user_id]
+            );
 
-        await pool.query(
-            'UPDATE users SET role = $1 WHERE user_id = $2',
-            ['FARMER', decoded.user_id]
-        );
+            await client.query('COMMIT');
 
-        const userResult = await pool.query(
-            `SELECT u.user_id, u.full_name, u.email, u.role, u.contact_number, 
-                    u.address, u.barangay, f.farmer_id
-             FROM users u
-             LEFT JOIN farmers f ON u.user_id = f.user_id
-             WHERE u.user_id = $1`,
-            [decoded.user_id]
-        );
+            console.log('✅ Farmer registered successfully!');
+            console.log('   - Farmer ID:', result.rows[0].farmer_id);
 
-        res.status(201).json({
-            success: true,
-            message: 'Farmer registration submitted successfully',
-            farmer: result.rows[0],
-            user: userResult.rows[0],
-            note: 'Pending verification'
-        });
+            const userResult = await pool.query(
+                `SELECT u.user_id, u.full_name, u.email, u.role, u.contact_number, 
+                        u.address, u.barangay, f.farmer_id
+                 FROM users u
+                 LEFT JOIN farmers f ON u.user_id = f.user_id
+                 WHERE u.user_id = $1`,
+                [req.user.user_id]
+            );
+
+            res.status(201).json({
+                success: true,
+                message: 'Farmer registration submitted successfully',
+                farmer: result.rows[0],
+                user: userResult.rows[0],
+                note: 'Pending verification'
+            });
+
+        } catch (error) {
+            await client.query('ROLLBACK');
+            throw error;
+        } finally {
+            client.release();
+        }
 
     } catch (error) {
         console.error('❌ Farmer registration error:', error);
@@ -579,7 +703,7 @@ app.post('/api/auth/register-farmer', async (req, res) => {
 
 // ========== ADMIN ENDPOINTS ==========
 app.post('/api/auth/create-first-admin', async (req, res) => {
-    console.log('🔥 Create first admin endpoint called');
+    console.log('👑 Create first admin endpoint called');
     
     try {
         const adminCheck = await pool.query(
@@ -679,30 +803,11 @@ app.post('/api/auth/create-first-admin', async (req, res) => {
     }
 });
 
-app.post('/api/auth/admin/register', async (req, res) => {
-    console.log('🔥 Admin registration endpoint called');
+app.post('/api/auth/admin/register', authenticateToken, async (req, res) => {
+    console.log('👥 Admin registration endpoint called by:', req.user.email);
     
     try {
-        const token = req.headers.authorization?.split(' ')[1];
-        
-        if (!token) {
-            return res.status(401).json({ 
-                success: false,
-                error: 'Admin token required' 
-            });
-        }
-        
-        const decoded = jwt.verify(
-            token, 
-            process.env.JWT_SECRET || 'your-secret-key-change-in-production'
-        );
-        
-        const adminCheck = await pool.query(
-            'SELECT * FROM users WHERE user_id = $1 AND role = $2',
-            [decoded.user_id, 'ADMIN']
-        );
-        
-        if (adminCheck.rows.length === 0) {
+        if (req.user.role !== 'ADMIN') {
             return res.status(403).json({ 
                 success: false,
                 error: 'Only administrators can register new admins' 
@@ -835,7 +940,7 @@ app.post('/api/auth/admin/register', async (req, res) => {
 });
 
 app.post('/api/auth/admin/login', async (req, res) => {
-    console.log('🔥 Admin login endpoint called');
+    console.log('👑 Admin login endpoint called');
     
     try {
         const { email, password } = req.body;
@@ -880,7 +985,8 @@ app.post('/api/auth/admin/login', async (req, res) => {
             { 
                 user_id: admin.user_id, 
                 email: admin.email, 
-                role: admin.role 
+                role: admin.role,
+                id: admin.user_id
             },
             process.env.JWT_SECRET || 'your-secret-key-change-in-production',
             { expiresIn: '7d' }
@@ -907,28 +1013,9 @@ app.post('/api/auth/admin/login', async (req, res) => {
     }
 });
 
-app.get('/api/auth/admin/users', async (req, res) => {
+app.get('/api/auth/admin/users', authenticateToken, async (req, res) => {
     try {
-        const token = req.headers.authorization?.split(' ')[1];
-        
-        if (!token) {
-            return res.status(401).json({ 
-                success: false,
-                error: 'Admin token required' 
-            });
-        }
-        
-        const decoded = jwt.verify(
-            token, 
-            process.env.JWT_SECRET || 'your-secret-key-change-in-production'
-        );
-        
-        const adminCheck = await pool.query(
-            'SELECT * FROM users WHERE user_id = $1 AND role = $2',
-            [decoded.user_id, 'ADMIN']
-        );
-        
-        if (adminCheck.rows.length === 0) {
+        if (req.user.role !== 'ADMIN') {
             return res.status(403).json({ 
                 success: false,
                 error: 'Admin access required' 
@@ -936,9 +1023,15 @@ app.get('/api/auth/admin/users', async (req, res) => {
         }
         
         const usersResult = await pool.query(
-            `SELECT user_id, full_name, email, role, contact_number, address, barangay, status, created_at 
+            `SELECT user_id, full_name, email, role, contact_number, address, barangay, status, created_at, updated_at
              FROM users 
-             ORDER BY created_at DESC`
+             ORDER BY 
+                CASE role 
+                    WHEN 'ADMIN' THEN 1 
+                    WHEN 'FARMER' THEN 2 
+                    ELSE 3 
+                END,
+                created_at DESC`
         );
         
         res.json({
@@ -949,14 +1042,6 @@ app.get('/api/auth/admin/users', async (req, res) => {
         
     } catch (error) {
         console.error('Get users error:', error);
-        
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ 
-                success: false,
-                error: 'Invalid token' 
-            });
-        }
-        
         res.status(500).json({
             success: false,
             error: 'Failed to get users'
@@ -1004,6 +1089,30 @@ if (feedbackRoutes) {
     console.error('❌ Feedback routes failed to load');
 }
 
+// ========== IMAGE CLASSIFIER ROUTES ==========
+if (classifyRoutes) {
+    app.use('/api', classifyRoutes);
+    console.log('✅ Image Classifier routes loaded successfully');
+    console.log('   - POST /api/classify');
+    console.log('   - POST /api/classify/batch');
+    console.log('   - POST /api/validate-product');
+    console.log('   - GET  /api/classifier/health');
+    console.log('   - GET  /api/classifier/classes');
+} else {
+    console.error('❌ Image Classifier routes failed to load');
+}
+
+// ========== ML MODEL INITIALIZATION ==========
+// Initialize Random Forest ML model on startup
+const randomForest = require('./services/ml/randomForestPredictor');
+
+// Train model after database connection is established
+setTimeout(async () => {
+    console.log('🤖 Initializing Random Forest ML model...');
+    await randomForest.trainModel();
+    console.log('✅ ML model ready');
+}, 5000);
+
 // ========== ERROR HANDLING ==========
 app.use((err, req, res, next) => {
     console.error('❌ Server error:', err.stack);
@@ -1017,47 +1126,107 @@ app.use((err, req, res, next) => {
 // 404 handler
 app.use('*', (req, res) => {
     console.log(`❌ 404: ${req.method} ${req.originalUrl}`);
-    res.status(404).json({
-        success: false,
-        error: 'Endpoint not found',
-        availableEndpoints: [
+    
+    const endpoints = {
+        auth: [
             'POST /api/auth/register',
             'POST /api/auth/login',
             'GET /api/auth/profile',
             'PUT /api/auth/update-profile',
-            'POST /api/auth/register-farmer',
+            'POST /api/auth/register-farmer'
+        ],
+        admin: [
             'POST /api/auth/create-first-admin',
             'POST /api/auth/admin/register',
             'POST /api/auth/admin/login',
-            'GET /api/auth/admin/users',
+            'GET /api/auth/admin/users'
+        ],
+        products: [
             'GET /api/products',
             'GET /api/products/:id',
+            'GET /api/products/farmer/products',
+            'POST /api/products',
+            'PUT /api/products/:id',
+            'DELETE /api/products/:id'
+        ],
+        farmers: [
+            'GET /api/farmers/dashboard',
+            'GET /api/farmers/profile',
+            'PUT /api/farmers/profile'
+        ],
+        orders: [
             'GET /api/orders/farmer',
-            'GET /api/orders/my-purchases',
             'GET /api/orders/:id',
-            'PUT /api/orders/:id/status',
-            'PUT /api/orders/:id/cancel',
+            'PUT /api/orders/:id/status'
+        ],
+        recommendations: [
+            'GET /api/recommendations/farm-performance',
+            'GET /api/recommendations/what-to-plant',
+            'GET /api/recommendations/what-to-sell',
+            'GET /api/recommendations/personalized-insights'
+        ],
+        cart: [
             'GET /api/cart',
             'POST /api/cart/add',
-            'GET /api/cart/count',
-            'PUT /api/cart/update/:id',
-            'DELETE /api/cart/remove/:id',
-            'DELETE /api/cart/clear',
-            'POST /api/cart/checkout',
-            'GET /health',
-            'GET /api/feedback',
-            'POST /api/feedback'
+            'DELETE /api/cart/remove/:id'
+        ],
+        classifier: [
+            'GET /api/classifier/health',
+            'GET /api/classifier/classes',
+            'POST /api/classify',
+            'POST /api/classify/batch',
+            'POST /api/validate-product'
+        ],
+        other: [
+            'GET /health'
         ]
+    };
+    
+    res.status(404).json({
+        success: false,
+        error: 'Endpoint not found',
+        message: `The requested endpoint ${req.method} ${req.originalUrl} does not exist`,
+        available_endpoints: endpoints
     });
 });
 
 // ========== START SERVER ==========
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || 'localhost';
 
-app.listen(PORT, () => {
-    console.log('\n' + '='.repeat(60));
-    console.log('🚀 DIGITAL MARKET BACKEND SERVER');
-    console.log('='.repeat(60));
-    console.log(`✅ Server running on: http://localhost:${PORT}`);
-    console.log('='.repeat(60) + '\n');
+const server = app.listen(PORT, HOST, () => {
+    console.log('\n' + '='.repeat(70));
+    console.log('🚀 DIGITAL FARMERS MARKET BACKEND SERVER');
+    console.log('='.repeat(70));
+    console.log(`📡 Server URL:      http://${HOST}:${PORT}`);
+    console.log(`📊 Health check:    http://${HOST}:${PORT}/health`);
+    console.log(`🕒 Started at:      ${new Date().toLocaleString()}`);
+    console.log(`🔧 Environment:     ${process.env.NODE_ENV || 'development'}`);
+    console.log(`💾 Database:        Digital-Farm-Market on ${process.env.DB_HOST || 'localhost'}`);
+    console.log('='.repeat(70) + '\n');
 });
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM signal received: closing HTTP server');
+    server.close(() => {
+        console.log('HTTP server closed');
+        pool.end(() => {
+            console.log('Database pool closed');
+            process.exit(0);
+        });
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT signal received: closing HTTP server');
+    server.close(() => {
+        console.log('HTTP server closed');
+        pool.end(() => {
+            console.log('Database pool closed');
+            process.exit(0);
+        });
+    });
+});
+
+module.exports = app;

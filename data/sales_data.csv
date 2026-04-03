@@ -1,0 +1,66 @@
+product_name,category,price,quantity_sold,sale_date,season,market_location
+Eggplant,Vegetables,45,100,2024-01-01,Wet,Bulan Public Market
+Tomato,Vegetables,60,107,2024-01-08,Wet,Bulan Public Market
+Kangkong,Leafy Greens,20,114,2024-01-15,Wet,Bulan Public Market
+Ampalaya,Vegetables,55,121,2024-01-22,Wet,Bulan Public Market
+Sitaw,Vegetables,35,128,2024-01-29,Wet,Bulan Public Market
+Okra,Vegetables,40,135,2024-02-05,Dry,Bulan Public Market
+Kalabasa,Vegetables,50,142,2024-02-12,Dry,Bulan Public Market
+Pechay,Leafy Greens,25,149,2024-02-19,Dry,Bulan Public Market
+Repolyo,Vegetables,70,156,2024-02-26,Dry,Bulan Public Market
+Carrots,Vegetables,80,163,2024-03-04,Dry,Bulan Public Market
+Labanos,Vegetables,30,170,2024-03-11,Dry,Bulan Public Market
+Patola,Vegetables,45,177,2024-03-18,Dry,Bulan Public Market
+Upo,Vegetables,35,184,2024-03-25,Dry,Bulan Public Market
+Sayote,Vegetables,40,191,2024-04-01,Dry,Bulan Public Market
+Malunggay,Leafy Greens,15,198,2024-04-08,Dry,Bulan Public Market
+Gabi,Root Crops,55,205,2024-04-15,Dry,Bulan Public Market
+Kamote,Root Crops,50,212,2024-04-22,Dry,Bulan Public Market
+Cassava,Root Crops,45,219,2024-04-29,Dry,Bulan Public Market
+Onion,Vegetables,90,226,2024-05-06,Dry,Bulan Public Market
+Garlic,Vegetables,120,233,2024-05-13,Dry,Bulan Public Market
+Ginger,Vegetables,100,240,2024-05-20,Dry,Bulan Public Market
+Bell Pepper,Vegetables,110,247,2024-05-27,Dry,Bulan Public Market
+Chili,Vegetables,130,254,2024-06-03,Dry,Bulan Public Market
+Cucumber,Vegetables,45,261,2024-06-10,Dry,Bulan Public Market
+Lettuce,Leafy Greens,60,268,2024-06-17,Dry,Bulan Public Market
+Mongo,Legumes,70,275,2024-06-24,Dry,Bulan Public Market
+Peanut,Legumes,80,282,2024-07-01,Wet,Bulan Public Market
+Alugbati,Leafy Greens,25,289,2024-07-08,Wet,Bulan Public Market
+Mustasa,Leafy Greens,30,296,2024-07-15,Wet,Bulan Public Market
+Basil,Herbs,35,303,2024-07-22,Wet,Bulan Public Market
+Spring Onion,Vegetables,45,310,2024-07-29,Wet,Bulan Public Market
+Leeks,Vegetables,60,317,2024-08-05,Wet,Bulan Public Market
+Red Onion,Vegetables,95,324,2024-08-12,Wet,Bulan Public Market
+White Onion,Vegetables,90,331,2024-08-19,Wet,Bulan Public Market
+Corn,Vegetables,35,338,2024-08-26,Wet,Bulan Public Market
+Green Peas,Legumes,85,345,2024-09-02,Wet,Bulan Public Market
+Turnip,Root Crops,50,352,2024-09-09,Wet,Bulan Public Market
+Spinach,Leafy Greens,35,359,2024-09-16,Wet,Bulan Public Market
+Parsley,Herbs,45,366,2024-09-23,Wet,Bulan Public Market
+Chayote Tops,Leafy Greens,25,373,2024-09-30,Wet,Bulan Public Market
+Eggplant,Vegetables,45,380,2024-10-07,Wet,Bulan Public Market
+Tomato,Vegetables,60,387,2024-10-14,Wet,Bulan Public Market
+Kangkong,Leafy Greens,20,394,2024-10-21,Wet,Bulan Public Market
+Ampalaya,Vegetables,55,101,2024-10-28,Wet,Bulan Public Market
+Sitaw,Vegetables,35,108,2024-11-04,Wet,Bulan Public Market
+Okra,Vegetables,40,115,2024-11-11,Wet,Bulan Public Market
+Kalabasa,Vegetables,50,122,2024-11-18,Wet,Bulan Public Market
+Pechay,Leafy Greens,25,129,2024-11-25,Wet,Bulan Public Market
+Repolyo,Vegetables,70,136,2024-12-02,Wet,Bulan Public Market
+Carrots,Vegetables,80,143,2024-12-09,Wet,Bulan Public Market
+Labanos,Vegetables,30,150,2024-12-16,Wet,Bulan Public Market
+Patola,Vegetables,45,157,2024-12-23,Wet,Bulan Public Market
+Upo,Vegetables,35,164,2024-12-30,Wet,Bulan Public Market
+Sayote,Vegetables,40,171,2025-01-06,Wet,Bulan Public Market
+Malunggay,Leafy Greens,15,178,2025-01-13,Wet,Bulan Public Market
+Gabi,Root Crops,55,185,2025-01-20,Wet,Bulan Public Market
+Kamote,Root Crops,50,192,2025-01-27,Wet,Bulan Public Market
+Cassava,Root Crops,45,199,2025-02-03,Dry,Bulan Public Market
+Onion,Vegetables,90,206,2025-02-10,Dry,Bulan Public Market
+Garlic,Vegetables,120,213,2025-02-17,Dry,Bulan Public Market
+Ginger,Vegetables,100,220,2025-02-24,Dry,Bulan Public Market
+Bell Pepper,Vegetables,110,227,2025-03-03,Dry,Bulan Public Market
+Chili,Vegetables,130,234,2025-03-10,Dry,Bulan Public Market
+Cucumber,Vegetables,45,241,2025-03-17,Dry,Bulan Public Market
+Lettuce,Leafy Greens,60,248,2025-03-24,Dry,Bulan Public Market

@@ -1,404 +1,447 @@
+// routes/recommendationRoutes.js
 const express = require('express');
 const router = express.Router();
 const { authenticateToken, authorizeRole } = require('../middleware/authMiddleware');
 const pool = require('../config/database');
-const demandPredictor = require('../services/ml/simpleDemandPredictor');
+const randomForest = require('../services/ml/randomForestPredictor');
 
-// GET /api/recommendations/demand-analysis - Farmer only
-router.get('/demand-analysis', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
+// ====================== HELPER FUNCTIONS ======================
+function getCurrentSeason() {
+    const month = new Date().getMonth() + 1;
+    return (month >= 3 && month <= 6) ? 'Dry' : 'Wet';
+}
+
+function getMonthName(month) {
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return months[month - 1];
+}
+
+// ===================== 1. YOUR FARM PERFORMANCE =====================
+router.get('/farm-performance', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
     try {
-        console.log('=== DEMAND ANALYSIS DEBUG ===');
-        console.log('req.user:', req.user);
+        const userId = req.user.user_id || req.user.id;
         
-        // Get user ID from req.user (now consistently set by auth middleware)
-        const userId = req.user.id;
-        console.log('User ID from JWT:', userId);
+        console.log('=== Farm Performance Debug ===');
+        console.log('User ID:', userId);
         
-        if (!userId) {
-            console.log('No user ID found in token');
-            return res.status(401).json({ 
-                success: false, 
-                error: 'User ID not found in token' 
-            });
-        }
+        // Get farmer_id from user_id
+        const farmerQuery = await pool.query(`
+            SELECT farmer_id FROM farmers WHERE user_id = $1
+        `, [userId]);
         
-        // Try to get farmer_id from farmers table
-        let farmerId = userId; // Default to using userId directly
-        
-        try {
-            const farmerQuery = await pool.query(
-                'SELECT farmer_id FROM farmers WHERE user_id = $1',
-                [userId]
-            );
-            
-            if (farmerQuery.rows.length > 0) {
-                farmerId = farmerQuery.rows[0].farmer_id;
-                console.log('Found farmer_id in farmers table:', farmerId);
-            } else {
-                console.log('No farmer record found, using user_id as farmer_id:', userId);
-            }
-        } catch (dbError) {
-            console.log('Error querying farmers table:', dbError.message);
-            console.log('Falling back to using user_id as farmer_id');
-        }
-
-        // Get farmer's products with their stats
-        const query = `
-            SELECT 
-                p.product_id as id,
-                p.product_name as name,
-                p.price,
-                p.view_count,
-                p.category as category_name,
-                COALESCE(SUM(oi.quantity), 0) as times_sold
-            FROM products p
-            LEFT JOIN order_items oi ON oi.product_id = p.product_id
-            LEFT JOIN orders o ON o.order_id = oi.order_id AND o.order_status = 'DELIVERED'
-            WHERE p.farmer_id = $1
-            GROUP BY p.product_id, p.product_name, p.price, p.view_count, p.category
-        `;
-        
-        const result = await pool.query(query, [farmerId]);
-        const products = result.rows;
-        
-        console.log(`Found ${products.length} products for farmer_id ${farmerId}`);
-
-        if (!products.length) {
+        if (farmerQuery.rows.length === 0) {
             return res.json({
                 success: true,
-                demand_analysis: []
+                products: [],
+                summary: {
+                    total_products: 0,
+                    total_sales: 0,
+                    top_product: 'None'
+                },
+                message: "Farmer profile not found"
             });
         }
-
-        // Format products for prediction
-        const productsForPrediction = products.map(p => ({
-            id: p.id,
-            name: p.name,
-            view_count: parseInt(p.view_count) || 0,
-            times_sold: parseInt(p.times_sold) || 0,
-            price: parseFloat(p.price) || 0
-        }));
-
-        // Get demand predictions
-        const demandAnalysis = await demandPredictor.predictBulkDemand(productsForPrediction);
-
-        // Sort by demand score
-        demandAnalysis.sort((a, b) => b.demand_score - a.demand_score);
-
-        // Format response
-        const formattedAnalysis = demandAnalysis.map(p => ({
-            product_id: p.id,
-            product_name: p.name,
-            category: products.find(prod => prod.id === p.id)?.category_name || 'Uncategorized',
-            demand_score: p.demand_score,
-            freq_c: p.view_count || 0,
-            times_sold: p.times_sold || 0
-        }));
-
-        res.json({
-            success: true,
-            demand_analysis: formattedAnalysis
-        });
-
-    } catch (error) {
-        console.error('Demand analysis error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
-    }
-});
-
-// GET /api/recommendations/market-insights - Farmer only
-router.get('/market-insights', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
-    try {
-        // Get top performing products across all farmers
-        const query = `
-            SELECT 
-                p.product_id as id,
-                p.product_name as name,
-                p.view_count,
-                p.category as category_name,
-                u.full_name as farmer_name,
-                COALESCE(SUM(oi.quantity), 0) as times_sold
-            FROM products p
-            LEFT JOIN users u ON u.user_id = p.farmer_id
-            LEFT JOIN order_items oi ON oi.product_id = p.product_id
-            LEFT JOIN orders o ON o.order_id = oi.order_id AND o.order_status = 'DELIVERED'
-            GROUP BY p.product_id, p.product_name, p.view_count, p.category, u.full_name
-            ORDER BY (p.view_count + COALESCE(SUM(oi.quantity), 0) * 10) DESC
-            LIMIT 10
-        `;
         
-        const result = await pool.query(query);
-        const products = result.rows;
-
-        const insights = await Promise.all(products.map(async (product) => {
-            // Create product object for prediction
-            const productObj = {
-                view_count: parseInt(product.view_count) || 0,
-                times_sold: parseInt(product.times_sold) || 0,
-                price: 0
-            };
-            
-            const demandScore = await demandPredictor.predictDemand(productObj);
-            
-            return {
-                product_name: product.name,
-                category: product.category_name || 'Uncategorized',
-                demand_score: demandScore.toFixed(1),
-                view_count: parseInt(product.view_count) || 0,
-                farmer: product.farmer_name || 'Unknown'
-            };
-        }));
-
+        const farmerId = farmerQuery.rows[0].farmer_id;
+        console.log('Farmer ID:', farmerId);
+        
+        // Get ALL farmer's products with sales from DELIVERED orders ONLY
+        const farmerProducts = await pool.query(`
+            SELECT 
+                p.product_id,
+                p.product_name,
+                p.price,
+                p.category,
+                COALESCE(
+                    (SELECT SUM(oi.quantity) 
+                     FROM order_items oi 
+                     JOIN orders o ON oi.order_id = o.order_id 
+                     WHERE oi.product_id = p.product_id 
+                     AND o.order_status = 'DELIVERED'
+                    ), 0
+                ) as total_sold
+            FROM products p
+            WHERE p.farmer_id = $1
+            ORDER BY p.product_name ASC
+        `, [farmerId]);
+        
+        console.log(`Found ${farmerProducts.rows.length} products`);
+        console.log('Products:', farmerProducts.rows.map(p => p.product_name));
+        
+        // Calculate totals
+        const totalProducts = farmerProducts.rows.length;
+        const totalSold = farmerProducts.rows.reduce((sum, p) => sum + parseInt(p.total_sold), 0);
+        const topProduct = farmerProducts.rows[0]?.product_name || 'None';
+        
         res.json({
             success: true,
-            insights: insights
+            products: farmerProducts.rows,
+            summary: {
+                total_products: totalProducts,
+                total_sales: totalSold,
+                top_product: topProduct
+            }
         });
-
+        
     } catch (error) {
-        console.error('Market insights error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
+        console.error('Farm performance error:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// GET /api/recommendations/seasonal - Public (no auth needed)
-router.get('/seasonal', async (req, res) => {
+// ===================== 2. WHAT TO PLANT (WITH RANDOM FOREST ML) =====================
+router.get('/what-to-plant', authenticateToken, async (req, res) => {
     try {
         const currentMonth = new Date().getMonth() + 1;
-        const season = currentMonth >= 3 && currentMonth <= 6 ? 'dry' : 'wet';
+        const currentSeason = getCurrentSeason();
         
-        const PHILIPPINE_SEASONS = {
-            'dry': {
-                name: 'Dry Season (Tag-araw)',
-                icon: 'fa-sun',
-                description: 'Hot and dry weather, perfect for sun-loving crops',
-                recommendations: ['Watermelon', 'Mango', 'Corn', 'Squash', 'Cucumber',
-                    'Sili', 'Talong', 'String Beans', 'Okra', 'Kalabasa', 'Ampalaya',
-                    'Pipino', 'Langka', 'Saging', 'Papaya']
-            },
-            'wet': {
-                name: 'Wet Season (Tag-ulan)',
-                icon: 'fa-cloud-rain',
-                description: 'Rainy weather, ideal for leafy vegetables',
-                recommendations: ['Rice', 'Pechay', 'Kangkong', 'Mustasa', 'Lettuce',
-                    'Cabbage', 'Cauliflower', 'Broccoli', 'Patola', 'Talong',
-                    'Labanos', 'Saluyot', 'Alugbati', 'Gabi', 'Ube', 'Kamote',
-                    'Saging', 'Papaya', 'Okra', 'Sitaw', 'Ampalaya', 'Upo',
-                    'Kamatis', 'Talbos ng Kamote', 'Luya', 'Singkamas']
+        const seasonalProducts = await pool.query(`
+            SELECT 
+                product_name,
+                demand_score,
+                planting_months,
+                expected_price,
+                notes
+            FROM seasonal_planting_guide
+            WHERE season = $1
+            ORDER BY demand_score DESC
+        `, [currentSeason]);
+        
+        const mlPredictions = [];
+        for (const product of seasonalProducts.rows) {
+            const marketData = await pool.query(`
+                SELECT total_sales, search_frequency, price_range_min as price
+                FROM market_product_demand
+                WHERE LOWER(product_name) = LOWER($1)
+            `, [product.product_name]);
+            
+            let mlScore = product.demand_score;
+            
+            if (marketData.rows.length > 0) {
+                try {
+                    mlScore = await randomForest.predictDemandScore({
+                        total_sales: marketData.rows[0].total_sales,
+                        search_frequency: marketData.rows[0].search_frequency,
+                        price: marketData.rows[0].price
+                    });
+                } catch (err) {
+                    console.error(`ML prediction failed for ${product.product_name}:`, err.message);
+                    mlScore = product.demand_score;
+                }
             }
-        };
-        
-        res.json({
-            success: true,
-            season: season,
-            current_season: PHILIPPINE_SEASONS[season].name,
-            description: PHILIPPINE_SEASONS[season].description,
-            recommendations: PHILIPPINE_SEASONS[season].recommendations
-        });
-    } catch (error) {
-        console.error('Seasonal error:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// NEW: GET /api/recommendations/personalized - Customer personalized recommendations
-router.get('/personalized', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        
-        if (!userId) {
-            return res.status(401).json({ 
-                success: false, 
-                error: 'User ID not found in token' 
+            
+            const minMonth = Math.min(...product.planting_months);
+            const maxMonth = Math.max(...product.planting_months);
+            let plantingStatus = '';
+            if (currentMonth >= minMonth && currentMonth <= maxMonth) {
+                plantingStatus = '🌱 Best time to plant now!';
+            } else if (currentMonth < minMonth) {
+                plantingStatus = `📅 Prepare for planting in ${getMonthName(minMonth)}`;
+            } else {
+                plantingStatus = '📋 Plan for next season';
+            }
+            
+            mlPredictions.push({
+                product_name: product.product_name,
+                demand_score: Math.round(mlScore * 10) / 10,
+                planting_months: product.planting_months,
+                month_names: product.planting_months.map(m => getMonthName(m)),
+                expected_price: product.expected_price,
+                notes: product.notes || 'High demand product',
+                planting_status: plantingStatus,
+                ml_insight: mlScore >= 7 ? '🔥 ML predicts HIGH demand' : 
+                           mlScore >= 5 ? '📈 ML predicts MEDIUM demand' : 
+                           '📊 ML predicts LOW demand'
             });
         }
-
-        // Get user's recently viewed products
-        const viewedQuery = `
-            SELECT 
-                p.product_id,
-                p.product_name,
-                p.price,
-                p.description,
-                p.image_url,
-                p.category,
-                p.farmer_id,
-                f.farm_name,
-                f.farm_location,
-                pv.viewed_at
-            FROM product_views pv
-            JOIN products p ON pv.product_id = p.product_id
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            WHERE pv.user_id = $1
-            ORDER BY pv.viewed_at DESC
-            LIMIT 8
-        `;
         
-        // Get similar products based on viewed categories and user preferences
-        const similarQuery = `
-            SELECT 
-                p.product_id,
-                p.product_name,
-                p.price,
-                p.description,
-                p.image_url,
-                p.category,
-                p.farmer_id,
-                f.farm_name,
-                f.farm_location,
-                COALESCE(p.view_count, 0) as popularity_score,
-                CASE 
-                    WHEN p.product_id IN (
-                        SELECT product_id FROM order_items oi
-                        JOIN orders o ON oi.order_id = o.order_id
-                        WHERE o.user_id = $1
-                    ) THEN 1 ELSE 0 
-                END as purchased_before
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            WHERE p.status = 'AVAILABLE'
-            AND p.category IN (
-                SELECT DISTINCT category 
-                FROM product_views pv
-                JOIN products p ON pv.product_id = p.product_id
-                WHERE pv.user_id = $1
-                UNION
-                SELECT DISTINCT p.category
-                FROM order_items oi
-                JOIN orders o ON oi.order_id = o.order_id
-                JOIN products p ON oi.product_id = p.product_id
-                WHERE o.user_id = $1 AND o.order_status = 'DELIVERED'
-            )
-            AND p.product_id NOT IN (
-                SELECT product_id FROM product_views WHERE user_id = $1
-            )
-            ORDER BY 
-                purchased_before DESC,
-                popularity_score DESC,
-                RANDOM()
-            LIMIT 8
-        `;
+        mlPredictions.sort((a, b) => b.demand_score - a.demand_score);
         
-        // Get trending products (high views/purchases in last 7 days)
-        const trendingQuery = `
-            SELECT 
-                p.product_id,
-                p.product_name,
-                p.price,
-                p.description,
-                p.image_url,
-                p.category,
-                p.farmer_id,
-                f.farm_name,
-                f.farm_location,
-                COUNT(DISTINCT pv.view_id) as recent_views,
-                COUNT(DISTINCT oi.order_item_id) as recent_purchases
-            FROM products p
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            LEFT JOIN product_views pv ON p.product_id = pv.product_id 
-                AND pv.viewed_at > CURRENT_DATE - INTERVAL '7 days'
-            LEFT JOIN order_items oi ON p.product_id = oi.product_id
-            LEFT JOIN orders o ON oi.order_id = o.order_id
-                AND o.order_date > CURRENT_DATE - INTERVAL '7 days'
-                AND o.order_status IN ('COMPLETED', 'DELIVERED')
-            WHERE p.status = 'AVAILABLE'
-            GROUP BY p.product_id, f.farm_name, f.farm_location
-            HAVING COUNT(DISTINCT pv.view_id) > 0 OR COUNT(DISTINCT oi.order_item_id) > 0
-            ORDER BY (COUNT(DISTINCT pv.view_id) * 0.4 + COUNT(DISTINCT oi.order_item_id) * 0.6) DESC
-            LIMIT 8
-        `;
-
-        // Get also bought products (based on order history)
-        const alsoBoughtQuery = `
-            WITH user_orders AS (
-                SELECT DISTINCT order_id 
-                FROM orders 
-                WHERE user_id = $1 AND order_status = 'DELIVERED'
-            ),
-            user_products AS (
-                SELECT DISTINCT oi.product_id
-                FROM order_items oi
-                JOIN user_orders uo ON oi.order_id = uo.order_id
-            ),
-            also_bought AS (
-                SELECT 
-                    oi2.product_id,
-                    COUNT(*) as times_bought_together
-                FROM user_products up
-                JOIN order_items oi1 ON up.product_id = oi1.product_id
-                JOIN order_items oi2 ON oi1.order_id = oi2.order_id 
-                    AND oi2.product_id != up.product_id
-                GROUP BY oi2.product_id
-                ORDER BY times_bought_together DESC
-                LIMIT 8
-            )
-            SELECT 
-                p.product_id,
-                p.product_name,
-                p.price,
-                p.description,
-                p.image_url,
-                p.category,
-                p.farmer_id,
-                f.farm_name,
-                f.farm_location,
-                ab.times_bought_together
-            FROM also_bought ab
-            JOIN products p ON ab.product_id = p.product_id
-            JOIN farmers f ON p.farmer_id = f.farmer_id
-            WHERE p.status = 'AVAILABLE'
-            ORDER BY ab.times_bought_together DESC
-        `;
-
-        // Execute all queries in parallel
-        const [viewedResult, similarResult, trendingResult, alsoBoughtResult] = await Promise.all([
-            pool.query(viewedQuery, [userId]),
-            pool.query(similarQuery, [userId]),
-            pool.query(trendingQuery),
-            pool.query(alsoBoughtQuery, [userId])
-        ]);
-
         res.json({
             success: true,
-            recommendations: {
-                recently_viewed: viewedResult.rows,
-                similar_products: similarResult.rows,
-                trending_products: trendingResult.rows,
-                frequently_bought_together: alsoBoughtResult.rows
-            },
-            metadata: {
-                user_id: userId,
-                generated_at: new Date().toISOString()
-            }
+            season: currentSeason,
+            current_month: currentMonth,
+            recommendations: mlPredictions,
+            ml_model: randomForest.isTrained ? "Random Forest Regression" : "Fallback Formula"
         });
-
+        
     } catch (error) {
-        console.error('Personalized recommendations error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
+        console.error('What to plant error:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// POST /api/recommendations/retrain - Admin only
-router.post('/retrain', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
+// ===================== 3. WHAT TO SELL =====================
+router.get('/what-to-sell', authenticateToken, async (req, res) => {
     try {
-        const success = await demandPredictor.trainModel();
+        const currentSeason = getCurrentSeason();
+        
+        const marketProducts = await pool.query(`
+            SELECT 
+                product_name,
+                category,
+                base_demand_score,
+                price_range_min,
+                price_range_max,
+                search_frequency,
+                total_sales
+            FROM market_product_demand
+            WHERE season = $1 OR season = 'Year-round'
+            ORDER BY base_demand_score DESC
+        `, [currentSeason]);
+        
+        const mlProducts = [];
+        for (const product of marketProducts.rows) {
+            let mlScore = product.base_demand_score;
+            
+            try {
+                mlScore = await randomForest.predictDemandScore({
+                    total_sales: product.total_sales,
+                    search_frequency: product.search_frequency,
+                    price: (product.price_range_min + product.price_range_max) / 2
+                });
+            } catch (err) {
+                console.error(`ML prediction failed for ${product.product_name}:`, err.message);
+                mlScore = product.base_demand_score;
+            }
+            
+            mlProducts.push({
+                product_name: product.product_name,
+                category: product.category,
+                demand_score: Math.round(mlScore * 10) / 10,
+                price_range_min: product.price_range_min,
+                price_range_max: product.price_range_max,
+                search_frequency: product.search_frequency || 0,
+                total_sales: product.total_sales,
+                demand_level: mlScore >= 7 ? 'High Demand' : mlScore >= 5 ? 'Medium Demand' : 'Low Demand',
+                ml_insight: mlScore >= 7 ? '🔥 ML: STRONG OPPORTUNITY' : 
+                           mlScore >= 5 ? '📈 ML: Good Opportunity' : 
+                           'ℹ️ ML: Monitor Market'
+            });
+        }
+        
+        mlProducts.sort((a, b) => b.demand_score - a.demand_score);
         
         res.json({
             success: true,
-            message: success ? 'Model retrained successfully' : 'Training failed - insufficient data'
+            season: currentSeason,
+            products: mlProducts,
+            ml_model: randomForest.isTrained ? "Random Forest Regression" : "Fallback Formula"
         });
-
+        
     } catch (error) {
-        console.error('Retrain error:', error);
-        res.status(500).json({ error: error.message });
+        console.error('What to sell error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ===================== 4. PERSONALIZED INSIGHTS (FIXED) =====================
+router.get('/personalized-insights', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
+    try {
+        const userId = req.user.user_id || req.user.id;
+        
+        // Get farmer_id from user_id
+        const farmerQuery = await pool.query(`
+            SELECT farmer_id FROM farmers WHERE user_id = $1
+        `, [userId]);
+        
+        if (farmerQuery.rows.length === 0) {
+            return res.json({
+                success: true,
+                recommendations: [],
+                farmer_summary: {
+                    total_products: 0,
+                    products_grown: [],
+                    existing_count: 0,
+                    high_priority_count: 0,
+                    new_opportunities_count: 0,
+                    total_recommendations: 0
+                }
+            });
+        }
+        
+        const farmerId = farmerQuery.rows[0].farmer_id;
+        
+        // Get ALL farmer's existing products
+        const farmerProducts = await pool.query(`
+            SELECT 
+                product_id,
+                product_name,
+                LOWER(TRIM(product_name)) as normalized_name,
+                price,
+                category
+            FROM products 
+            WHERE farmer_id = $1
+            ORDER BY product_name ASC
+        `, [farmerId]);
+        
+        const farmerProductNames = farmerProducts.rows.map(p => p.normalized_name);
+        
+        // Get ALL market products
+        const marketProducts = await pool.query(`
+            SELECT 
+                product_name,
+                LOWER(TRIM(product_name)) as normalized_name,
+                base_demand_score,
+                price_range_min,
+                price_range_max,
+                total_sales,
+                search_frequency
+            FROM market_product_demand
+            ORDER BY base_demand_score DESC
+        `);
+        
+        const recommendations = [];
+        
+        for (const market of marketProducts.rows) {
+            const marketNormalized = market.normalized_name;
+            
+            // Check if farmer already grows this product
+            let farmerGrows = farmerProductNames.includes(marketNormalized);
+            let matchedProduct = farmerProducts.rows.find(p => p.normalized_name === marketNormalized);
+            
+            // Calculate ML demand score
+            let mlScore = market.base_demand_score;
+            
+            try {
+                mlScore = await randomForest.predictDemandScore({
+                    total_sales: market.total_sales || 0,
+                    search_frequency: market.search_frequency || 0,
+                    price: (market.price_range_min + market.price_range_max) / 2
+                });
+            } catch (err) {
+                mlScore = market.base_demand_score;
+            }
+            
+            // Round to 1 decimal
+            const finalScore = Math.round(mlScore * 10) / 10;
+            
+            // Determine priority (for backend use)
+            let priority = finalScore >= 7 ? 'HIGH' : (finalScore >= 5 ? 'MEDIUM' : 'LOW');
+            
+            // Determine action
+            let action = '';
+            let type = farmerGrows ? 'existing' : 'new';
+            
+            if (farmerGrows) {
+                action = finalScore >= 7 ? 'Start selling now!' : (finalScore >= 5 ? 'Good opportunity' : 'Monitor market');
+            } else {
+                action = finalScore >= 7 ? '🌱 Add to farm!' : (finalScore >= 5 ? '📈 Consider adding' : 'ℹ️ Monitor');
+            }
+            
+            recommendations.push({
+                product_name: market.product_name,
+                type: type,
+                demand_score: finalScore,
+                market_price: `₱${market.price_range_min} - ₱${market.price_range_max}`,
+                market_sales: market.total_sales || 0,
+                action: action,
+                priority: priority
+            });
+        }
+        
+        recommendations.sort((a, b) => b.demand_score - a.demand_score);
+        
+        // ACCURATE COUNTS
+        const farmerActualProducts = farmerProducts.rows.length; // Farmer's actual products
+        const existingCount = recommendations.filter(r => r.type === 'existing').length;
+        const highPriorityCount = recommendations.filter(r => r.demand_score >= 7).length;
+        const newOpportunitiesCount = recommendations.filter(r => r.type === 'new' && r.demand_score >= 7).length;
+        
+        console.log('=== ACCURATE COUNTS ===');
+        console.log('Farmer Actual Products:', farmerActualProducts);
+        console.log('Existing Products in Market:', existingCount);
+        console.log('High Priority (score >= 7):', highPriorityCount);
+        console.log('New Opportunities (new + score >= 7):', newOpportunitiesCount);
+        
+        res.json({
+            success: true,
+            recommendations: recommendations,
+            farmer_summary: {
+                total_products: farmerActualProducts,  // Farmer's actual product count
+                products_grown: farmerProducts.rows.map(p => p.product_name),
+                existing_count: existingCount,
+                high_priority_count: highPriorityCount,
+                new_opportunities_count: newOpportunitiesCount,
+                total_recommendations: recommendations.length
+            }
+        });
+        
+    } catch (error) {
+        console.error('Personalized insights error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ===================== ML MODEL STATUS =====================
+router.get('/ml-status', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
+    try {
+        const marketCount = await pool.query('SELECT COUNT(*) FROM market_product_demand');
+        const seasonalCount = await pool.query('SELECT COUNT(*) FROM seasonal_planting_guide');
+        
+        res.json({
+            success: true,
+            ml_model: {
+                is_trained: randomForest.isTrained,
+                type: "Random Forest Regression",
+                features: ["Total Sales", "Search Frequency", "Price"]
+            },
+            data_status: {
+                market_products: parseInt(marketCount.rows[0].count),
+                seasonal_guides: parseInt(seasonalCount.rows[0].count),
+                has_data: parseInt(marketCount.rows[0].count) > 0
+            }
+        });
+        
+    } catch (error) {
+        console.error('ML status error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ===================== FORCE RETRAIN ML MODEL =====================
+router.post('/retrain-ml', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
+    try {
+        const success = await randomForest.trainModel();
+        
+        res.json({
+            success: true,
+            message: success ? 'Random Forest model retrained successfully' : 'Training failed',
+            is_trained: randomForest.isTrained
+        });
+        
+    } catch (error) {
+        console.error('Retrain ML error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ===================== CHECK DATA STATUS =====================
+router.get('/data-status', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
+    try {
+        const marketData = await pool.query('SELECT COUNT(*) FROM market_product_demand');
+        const seasonalData = await pool.query('SELECT COUNT(*) FROM seasonal_planting_guide');
+        
+        const sample = await pool.query(`
+            SELECT product_name, total_sales, search_frequency, base_demand_score
+            FROM market_product_demand
+            LIMIT 5
+        `);
+        
+        res.json({
+            success: true,
+            market_products_count: parseInt(marketData.rows[0].count),
+            seasonal_guides_count: parseInt(seasonalData.rows[0].count),
+            sample_data: sample.rows,
+            ml_ready: randomForest.isTrained,
+            recommendation: parseInt(marketData.rows[0].count) > 0 ? 
+                "System ready. Run /retrain-ml to train model." : 
+                "No market data found. Run import-market-reference.js first."
+        });
+        
+    } catch (error) {
+        console.error('Data status error:', error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 

@@ -2,13 +2,13 @@
 const db = require('../config/database');
 
 const feedbackModel = {
-    // Check if user purchased this product
+    // Check if user purchased this product - FIXED with correct column name
     async checkUserPurchase(userId, productId, orderId) {
         const query = `
             SELECT oi.order_item_id 
             FROM order_items oi
             JOIN orders o ON oi.order_id = o.order_id
-            WHERE o.user_id = $1 AND oi.product_id = $2 AND o.order_id = $3
+            WHERE o.customer_id = $1 AND oi.product_id = $2 AND o.order_id = $3
         `;
         const result = await db.query(query, [userId, productId, orderId]);
         return result.rows.length > 0;

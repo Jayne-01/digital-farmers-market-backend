@@ -17,12 +17,14 @@ const authenticateToken = (req, res, next) => {
         // This maps user_id or sub to id for consistency
         req.user = {
             ...user,
-            id: user.user_id || user.id || user.sub
+            id: user.user_id || user.id || user.sub,
+            user_id: user.user_id || user.id || user.sub, // Also keep user_id for compatibility
+            role: user.role || user.userRole
         };
         
         console.log('✅ User authenticated:', { 
             id: req.user.id, 
-            role: req.user.role || req.user.userRole,
+            role: req.user.role,
             email: req.user.email 
         });
         
@@ -34,13 +36,13 @@ const authorizeRole = (...roles) => {
     return (req, res, next) => {
         console.log('=== AUTHORIZE ROLE CALLED ===');
         console.log('Roles passed:', roles); 
-        console.log('User role from JWT:', req.user?.role || req.user?.userRole);
+        console.log('User role from JWT:', req.user?.role);
         
         if (!req.user) {
             return res.status(401).json({ error: 'Authentication required' });
         }
         
-        const userRole = req.user.role || req.user.userRole;
+        const userRole = req.user.role;
         
         if (!roles.includes(userRole)) {
             console.log('ROLE MISMATCH!');
@@ -53,7 +55,7 @@ const authorizeRole = (...roles) => {
             });
         }
         
-        console.log('Role check PASSED!');
+        console.log('✅ Role check PASSED!');
         next();
     };
 };
