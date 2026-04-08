@@ -33,14 +33,57 @@ const validateProductImage = async (imageBuffer, category, originalname) => {
         
         const predictedCategory = result.prediction;
         const confidence = result.confidence;
+        
+        // RULE 1: Reject if model predicts "unknown" (non-food images)
+        if (predictedCategory === 'unknown') {
+            return {
+                isValid: false,
+                error: '❌ Invalid Product: This image does not appear to be a valid agricultural product. Please upload a photo of Rice, Fruits, Vegetables, or Crops.',
+                prediction: predictedCategory,
+                confidence: confidence
+            };
+        }
+        
+        // RULE 2: Reject if confidence is too low (below 50%)
+        if (confidence < 50) {
+            return {
+                isValid: false,
+                error: `⚠️ Low Quality Image: Our AI is only ${confidence}% confident about this image. Please upload a clearer photo with better lighting and a plain background.`,
+                prediction: predictedCategory,
+                confidence: confidence
+            };
+        }
+        
+        // RULE 3: Check if predicted category matches selected category
         const isValid = predictedCategory.toLowerCase() === category.toLowerCase();
         
+        // RULE 4: If mismatch, provide helpful suggestion
+        if (!isValid) {
+            let suggestion = '';
+            if (predictedCategory === 'fruits') suggestion = 'Did you mean to select "Fruits" as the category?';
+            else if (predictedCategory === 'vegetables') suggestion = 'Did you mean to select "Vegetables" as the category?';
+            else if (predictedCategory === 'crops') suggestion = 'Did you mean to select "Crops" as the category?';
+            else if (predictedCategory === 'rice') suggestion = 'Did you mean to select "Rice" as the category?';
+            else suggestion = 'Please verify your product category or upload a different image.';
+            
+            return {
+                isValid: false,
+                error: `❌ Category Mismatch: You selected "${category}", but our AI detected "${predictedCategory}" (${confidence}% confident). ${suggestion}`,
+                prediction: predictedCategory,
+                confidence: confidence,
+                suggestedCategory: predictedCategory
+            };
+        }
+        
+        // SUCCESS: Image is valid
         return {
-            isValid: isValid,
+            isValid: true,
             prediction: predictedCategory,
             confidence: confidence,
-            probabilities: result.probabilities
+            probabilities: result.probabilities,
+            message: `✓ Verified: This is a valid ${category} product (${confidence}% confidence)`
         };
+        
     } catch (error) {
         console.error('Image validation error:', error);
         return {
@@ -263,28 +306,16 @@ router.post('/',
                 return await productController.createProduct(req, res);
             }
 
-            // UPDATED: Only require 30% confidence, not 50%
+            // Reject if validation failed
             if (!validation.isValid) {
                 return res.status(400).json({
                     success: false,
-                    message: `Image validation failed. Image appears to be ${validation.prediction || 'unknown'}, but product category is ${category}. Please upload a correct image.`,
+                    message: validation.error,
                     validation: {
                         predicted: validation.prediction,
                         confidence: validation.confidence,
-                        expected: category
-                    }
-                });
-            }
-
-            // UPDATED: Lower confidence threshold to 30%
-            if (validation.confidence < 30) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Image quality too low. Confidence: ${validation.confidence}%. Please upload a clearer image.`,
-                    validation: {
-                        predicted: validation.prediction,
-                        confidence: validation.confidence,
-                        expected: category
+                        expected: category,
+                        suggested: validation.suggestedCategory
                     }
                 });
             }
@@ -382,16 +413,100 @@ router.get('/', async (req, res) => {
     }
 });
 
-// GET /api/products/search - Search products (public)
+// ========== UPDATED SEARCH ENDPOINT WITH SYNONYM SUPPORT ==========
+// GET /api/products/search - Search products with synonym support
 router.get('/search', async (req, res) => {
     try {
-        await productController.searchProducts(req, res);
+        const { query: searchQuery, synonyms, category, minPrice, maxPrice } = req.query;
+        
+        if (!searchQuery) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'Search query is required' 
+            });
+        }
+
+        // Build search terms including synonyms from frontend
+        let searchTerms = [searchQuery.toLowerCase()];
+        
+        // Parse synonyms if provided (from frontend)
+        if (synonyms) {
+            const extraTerms = synonyms.split(',');
+            searchTerms.push(...extraTerms);
+        }
+        
+        // Remove duplicates
+        searchTerms = [...new Set(searchTerms)];
+        
+        // Build SQL query with multiple terms
+        const conditions = searchTerms.map((term, i) => 
+            `(p.product_name ILIKE $${i + 1} OR p.local_name ILIKE $${i + 1} OR p.description ILIKE $${i + 1})`
+        ).join(' OR ');
+        
+        const params = searchTerms.map(term => `%${term}%`);
+        let paramIndex = searchTerms.length + 1;
+        
+        let sql = `
+            SELECT 
+                p.*,
+                f.farm_name,
+                f.barangay,
+                u.full_name as farmer_name,
+                COALESCE((SELECT AVG(fb.rating) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as avg_rating,
+                COALESCE((SELECT COUNT(*) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as review_count
+            FROM products p
+            JOIN farmers f ON p.farmer_id = f.farmer_id
+            JOIN users u ON f.user_id = u.user_id
+            WHERE p.status = 'AVAILABLE' 
+            AND (${conditions})
+        `;
+        
+        // Add category filter if provided
+        if (category) {
+            sql += ` AND p.category = $${paramIndex}`;
+            params.push(category);
+            paramIndex++;
+        }
+        
+        // Add price filters if provided
+        if (minPrice) {
+            sql += ` AND p.price >= $${paramIndex}`;
+            params.push(parseFloat(minPrice));
+            paramIndex++;
+        }
+        
+        if (maxPrice) {
+            sql += ` AND p.price <= $${paramIndex}`;
+            params.push(parseFloat(maxPrice));
+            paramIndex++;
+        }
+        
+        sql += ' ORDER BY p.view_count DESC, p.created_at DESC LIMIT 50';
+        
+        console.log('Search terms used:', searchTerms);
+        
+        const result = await pool.query(sql, params);
+        
+        // Transform the results
+        const products = result.rows.map(product => ({
+            ...product,
+            average_rating: product.avg_rating
+        }));
+        
+        console.log(`Search found ${products.length} products for "${searchQuery}"`);
+        
+        res.json({
+            success: true,
+            products: products,
+            count: products.length,
+            search_terms_used: searchTerms
+        });
+
     } catch (error) {
-        console.error('Route error - search products:', error);
+        console.error('Search products error:', error);
         res.status(500).json({ 
-            success: false,
-            message: 'Internal server error',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+            success: false, 
+            error: 'Server error' 
         });
     }
 });
@@ -488,21 +603,12 @@ router.put('/:id(\\d+)',
                     } else if (!validation.isValid) {
                         return res.status(400).json({
                             success: false,
-                            message: `Image validation failed. Image appears to be ${validation.prediction || 'unknown'}, but product category is ${productCategory}. Please upload a correct image.`,
+                            message: validation.error,
                             validation: {
                                 predicted: validation.prediction,
                                 confidence: validation.confidence,
-                                expected: productCategory
-                            }
-                        });
-                    } else if (validation.confidence < 30) {
-                        return res.status(400).json({
-                            success: false,
-                            message: `Image quality too low. Confidence: ${validation.confidence}%. Please upload a clearer image.`,
-                            validation: {
-                                predicted: validation.prediction,
-                                confidence: validation.confidence,
-                                expected: productCategory
+                                expected: productCategory,
+                                suggested: validation.suggestedCategory
                             }
                         });
                     }

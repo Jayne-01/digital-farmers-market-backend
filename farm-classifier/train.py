@@ -11,8 +11,8 @@ import json
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 32
 EPOCHS = 50
-NUM_CLASSES = 4
-CLASS_NAMES = ['fruits', 'vegetables', 'crops', 'rice']
+NUM_CLASSES = 5 
+CLASS_NAMES = ['fruits', 'vegetables', 'crops', 'rice', 'unknown'] 
 
 TRAIN_DIR = 'data/train'
 VALIDATION_DIR = 'data/validation'
@@ -68,7 +68,7 @@ def create_pretrained_model():
         layers.Dropout(0.5),
         layers.Dense(256, activation='relu'),
         layers.Dropout(0.3),
-        layers.Dense(NUM_CLASSES, activation='softmax')
+        layers.Dense(NUM_CLASSES, activation='softmax')  # Now 5 classes
     ])
     
     return model

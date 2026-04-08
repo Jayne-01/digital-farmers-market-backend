@@ -66,11 +66,12 @@ app.use(helmet({
 }));
 
 app.use(cors({
-    origin: ['http://localhost:3000', 'http://localhost:5000', 'http://127.0.0.1:3000'],
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+app.options('*', cors());
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -397,13 +398,21 @@ app.post('/api/auth/login', async (req, res) => {
         }
         
         let farmer_id = null;
+        let isVerifiedFarmer = false;
+        
         if (user.role === 'FARMER') {
             const farmerResult = await pool.query(
-                'SELECT farmer_id FROM farmers WHERE user_id = $1',
+                'SELECT farmer_id, verified_status FROM farmers WHERE user_id = $1',
                 [user.user_id]
             );
             if (farmerResult.rows.length > 0) {
                 farmer_id = farmerResult.rows[0].farmer_id;
+                isVerifiedFarmer = farmerResult.rows[0].verified_status;
+                
+                // If farmer is not verified, treat as customer
+                if (!isVerifiedFarmer) {
+                    user.role = 'CUSTOMER';
+                }
             }
         }
         
@@ -421,9 +430,10 @@ app.post('/api/auth/login', async (req, res) => {
         delete user.password;
         
         user.farmer_id = farmer_id;
+        user.is_verified_farmer = isVerifiedFarmer;
         
         console.log('✅ User logged in:', user.email);
-        console.log('✅ Farmer ID:', farmer_id);
+        console.log('✅ Role assigned:', user.role);
         
         res.json({
             success: true,
@@ -487,6 +497,7 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
  */
 app.put('/api/auth/update-profile', authenticateToken, async (req, res) => {
     console.log('📝 Update profile endpoint called');
+    console.log('Request body:', req.body);
     
     try {
         const { 
@@ -496,18 +507,11 @@ app.put('/api/auth/update-profile', authenticateToken, async (req, res) => {
             barangay 
         } = req.body;
         
-        if (!full_name && !contact_number && !address && !barangay) {
-            return res.status(400).json({ 
-                success: false,
-                error: 'At least one field must be provided for update'
-            });
-        }
-        
         let updateFields = [];
         let values = [];
         let paramCount = 1;
         
-        if (full_name) {
+        if (full_name !== undefined) {
             updateFields.push(`full_name = $${paramCount}`);
             values.push(full_name);
             paramCount++;
@@ -529,6 +533,13 @@ app.put('/api/auth/update-profile', authenticateToken, async (req, res) => {
             updateFields.push(`barangay = $${paramCount}`);
             values.push(barangay || null);
             paramCount++;
+        }
+        
+        if (updateFields.length === 0) {
+            return res.status(400).json({ 
+                success: false,
+                error: 'At least one field must be provided for update'
+            });
         }
         
         updateFields.push(`updated_at = NOW()`);
@@ -553,11 +564,12 @@ app.put('/api/auth/update-profile', authenticateToken, async (req, res) => {
         
         if (updatedUser.role === 'FARMER') {
             const farmerResult = await pool.query(
-                'SELECT farmer_id FROM farmers WHERE user_id = $1',
+                'SELECT farmer_id, verified_status FROM farmers WHERE user_id = $1',
                 [updatedUser.user_id]
             );
             if (farmerResult.rows.length > 0) {
                 updatedUser.farmer_id = farmerResult.rows[0].farmer_id;
+                updatedUser.verified_status = farmerResult.rows[0].verified_status;
             }
         }
         
@@ -587,9 +599,106 @@ app.put('/api/auth/update-profile', authenticateToken, async (req, res) => {
     }
 });
 
+// ========== FARMER PROFILE UPDATE ENDPOINT ==========
+/**
+ * @route   PUT /api/farmers/profile
+ * @desc    Update farmer profile
+ * @access  Private (Farmer only)
+ */
+app.put('/api/farmers/profile', authenticateToken, async (req, res) => {
+    console.log('🌾 Update farmer profile endpoint called');
+    console.log('Request body:', req.body);
+    console.log('User ID:', req.user.user_id);
+    
+    try {
+        const { farm_name, barangay, farm_description } = req.body;
+        const userId = req.user.user_id;
+        
+        // Check if farmer exists
+        const checkQuery = await pool.query(
+            'SELECT farmer_id, verified_status FROM farmers WHERE user_id = $1',
+            [userId]
+        );
+        
+        if (checkQuery.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Farmer profile not found. Please register as a farmer first.'
+            });
+        }
+        
+        // Check if farmer is verified
+        if (!checkQuery.rows[0].verified_status) {
+            return res.status(403).json({
+                success: false,
+                error: 'Cannot update profile. Your farmer application is pending approval.'
+            });
+        }
+        
+        // Build dynamic update query
+        let updateFields = [];
+        let values = [];
+        let paramCount = 1;
+        
+        if (farm_name !== undefined) {
+            updateFields.push(`farm_name = $${paramCount}`);
+            values.push(farm_name);
+            paramCount++;
+        }
+        
+        if (barangay !== undefined) {
+            updateFields.push(`barangay = $${paramCount}`);
+            values.push(barangay || null);
+            paramCount++;
+        }
+        
+        if (farm_description !== undefined) {
+            updateFields.push(`farm_description = $${paramCount}`);
+            values.push(farm_description || null);
+            paramCount++;
+        }
+        
+        if (updateFields.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'No fields to update'
+            });
+        }
+        
+        updateFields.push(`updated_at = NOW()`);
+        values.push(userId);
+        
+        const query = `
+            UPDATE farmers 
+            SET ${updateFields.join(', ')}
+            WHERE user_id = $${paramCount}
+            RETURNING farmer_id, farm_name, barangay, farm_description, verified_status, created_at, updated_at
+        `;
+        
+        const result = await pool.query(query, values);
+        
+        console.log('✅ Farm profile updated for user:', userId);
+        console.log('Updated data:', result.rows[0]);
+        
+        res.json({
+            success: true,
+            message: 'Farm profile updated successfully',
+            farmer: result.rows[0]
+        });
+        
+    } catch (error) {
+        console.error('❌ Error updating farm profile:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to update farm profile',
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
 /**
  * @route   POST /api/auth/register-farmer
- * @desc    Register as a farmer
+ * @desc    Register as a farmer (pending admin approval)
  * @access  Private
  */
 app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
@@ -598,6 +707,14 @@ app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
     try {
         const { farm_name, farm_location, farm_description } = req.body;
 
+        // Check if user is already a verified farmer
+        if (req.user.role === 'FARMER') {
+            return res.status(400).json({
+                success: false,
+                error: 'You are already registered as a verified farmer'
+            });
+        }
+
         if (!farm_name) {
             return res.status(400).json({
                 success: false,
@@ -605,17 +722,27 @@ app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
             });
         }
 
+        // Check if farmer profile already exists
         const existingFarmer = await pool.query(
-            'SELECT farmer_id FROM farmers WHERE user_id = $1',
+            'SELECT farmer_id, verified_status FROM farmers WHERE user_id = $1',
             [req.user.user_id]
         );
 
         if (existingFarmer.rows.length > 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'Farmer profile already exists',
-                farmer_id: existingFarmer.rows[0].farmer_id
-            });
+            const farmer = existingFarmer.rows[0];
+            if (farmer.verified_status) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Farmer profile already exists and is verified'
+                });
+            } else {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Farmer application already pending admin approval',
+                    farmer_id: farmer.farmer_id,
+                    status: 'PENDING'
+                });
+            }
         }
 
         const client = await pool.connect();
@@ -623,6 +750,7 @@ app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
         try {
             await client.query('BEGIN');
             
+            // Insert farmer with verified_status = false (pending approval)
             const result = await client.query(
                 `INSERT INTO farmers (
                     user_id,
@@ -630,9 +758,10 @@ app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
                     barangay,
                     farm_description,
                     verified_status,
-                    created_at
+                    created_at,
+                    updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, NOW())
+                VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
                 RETURNING
                     farmer_id,
                     farm_name,
@@ -645,35 +774,27 @@ app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
                     farm_name,
                     farm_location || null,
                     farm_description || null,
-                    false
+                    false  // Not verified until admin approves
                 ]
             );
 
-            await client.query(
-                'UPDATE users SET role = $1, updated_at = NOW() WHERE user_id = $2',
-                ['FARMER', req.user.user_id]
-            );
+            // IMPORTANT: User role remains as CUSTOMER until admin approves
+            // No role change here
 
             await client.query('COMMIT');
 
-            console.log('✅ Farmer registered successfully!');
+            console.log('✅ Farmer registration submitted for approval!');
             console.log('   - Farmer ID:', result.rows[0].farmer_id);
-
-            const userResult = await pool.query(
-                `SELECT u.user_id, u.full_name, u.email, u.role, u.contact_number, 
-                        u.address, u.barangay, f.farmer_id
-                 FROM users u
-                 LEFT JOIN farmers f ON u.user_id = f.user_id
-                 WHERE u.user_id = $1`,
-                [req.user.user_id]
-            );
+            console.log('   - Status: PENDING APPROVAL');
 
             res.status(201).json({
                 success: true,
-                message: 'Farmer registration submitted successfully',
-                farmer: result.rows[0],
-                user: userResult.rows[0],
-                note: 'Pending verification'
+                message: 'Farmer registration submitted successfully. Your application is pending admin approval.',
+                farmer: {
+                    ...result.rows[0],
+                    status: 'PENDING'
+                },
+                note: 'You will be notified once your application is approved or rejected.'
             });
 
         } catch (error) {
@@ -696,7 +817,391 @@ app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
         res.status(500).json({
             success: false,
             error: 'Failed to register as farmer',
-            details: error.message
+            details: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
+// ========== ADMIN FARMER APPROVAL ENDPOINTS ==========
+
+/**
+ * @route   GET /api/auth/admin/pending-farmers
+ * @desc    Get all pending farmer applications
+ * @access  Admin only
+ */
+app.get('/api/auth/admin/pending-farmers', authenticateToken, authorizeRole(['ADMIN']), async (req, res) => {
+    console.log('📋 Fetching pending farmer applications');
+
+    try {
+        const result = await pool.query(
+            `SELECT 
+                f.farmer_id,
+                f.farm_name,
+                f.barangay as farm_location,
+                f.farm_description,
+                f.verified_status,
+                f.created_at as application_date,
+                u.user_id,
+                u.full_name,
+                u.email,
+                u.contact_number,
+                u.address,
+                u.barangay as user_barangay
+             FROM farmers f
+             JOIN users u ON f.user_id = u.user_id
+             WHERE f.verified_status = false
+             ORDER BY f.created_at ASC`,
+            []
+        );
+
+        console.log(`Found ${result.rows.length} pending farmer applications`);
+
+        res.json({
+            success: true,
+            count: result.rows.length,
+            applications: result.rows.map(app => ({
+                ...app,
+                status: 'PENDING'
+            }))
+        });
+
+    } catch (error) {
+        console.error('Error fetching pending farmers:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch pending applications'
+        });
+    }
+});
+
+/**
+ * @route   GET /api/auth/admin/all-farmers
+ * @desc    Get all farmers (verified and pending)
+ * @access  Admin only
+ */
+app.get('/api/auth/admin/all-farmers', authenticateToken, authorizeRole(['ADMIN']), async (req, res) => {
+    console.log('📋 Fetching all farmers');
+
+    try {
+        const result = await pool.query(
+            `SELECT 
+                f.farmer_id,
+                f.farm_name,
+                f.barangay as farm_location,
+                f.farm_description,
+                f.verified_status,
+                f.created_at as registration_date,
+                f.updated_at,
+                u.user_id,
+                u.full_name,
+                u.email,
+                u.contact_number,
+                u.address,
+                u.barangay as user_barangay,
+                u.status as user_status
+             FROM farmers f
+             JOIN users u ON f.user_id = u.user_id
+             ORDER BY f.verified_status ASC, f.created_at DESC`,
+            []
+        );
+
+        const farmers = result.rows.map(farmer => ({
+            ...farmer,
+            status: farmer.verified_status ? 'APPROVED' : 'PENDING'
+        }));
+
+        res.json({
+            success: true,
+            count: farmers.length,
+            farmers: farmers
+        });
+
+    } catch (error) {
+        console.error('Error fetching all farmers:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch farmers'
+        });
+    }
+});
+
+/**
+ * @route   PUT /api/auth/admin/approve-farmer/:farmerId
+ * @desc    Approve a farmer application
+ * @access  Admin only
+ */
+app.put('/api/auth/admin/approve-farmer/:farmerId', authenticateToken, authorizeRole(['ADMIN']), async (req, res) => {
+    console.log('✅ Admin approving farmer:', req.params.farmerId);
+
+    const client = await pool.connect();
+
+    try {
+        const { farmerId } = req.params;
+
+        await client.query('BEGIN');
+
+        // Check if farmer exists and is not already verified
+        const farmerCheck = await client.query(
+            `SELECT f.farmer_id, f.user_id, f.verified_status, u.email, u.full_name, u.role
+             FROM farmers f
+             JOIN users u ON f.user_id = u.user_id
+             WHERE f.farmer_id = $1`,
+            [farmerId]
+        );
+
+        if (farmerCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({
+                success: false,
+                error: 'Farmer application not found'
+            });
+        }
+
+        const farmer = farmerCheck.rows[0];
+
+        if (farmer.verified_status === true) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: 'Farmer application has already been approved'
+            });
+        }
+
+        // Update farmer verification status
+        await client.query(
+            `UPDATE farmers 
+             SET verified_status = true, 
+                 updated_at = NOW()
+             WHERE farmer_id = $1`,
+            [farmerId]
+        );
+
+        // Update user role to FARMER
+        await client.query(
+            `UPDATE users 
+             SET role = 'FARMER', 
+                 updated_at = NOW()
+             WHERE user_id = $1`,
+            [farmer.user_id]
+        );
+
+        await client.query('COMMIT');
+
+        console.log('✅ Farmer application approved!');
+        console.log('   - Farmer ID:', farmerId);
+        console.log('   - User ID:', farmer.user_id);
+        console.log('   - Email:', farmer.email);
+        console.log('   - Name:', farmer.full_name);
+
+        res.json({
+            success: true,
+            message: 'Farmer application approved successfully',
+            farmer: {
+                farmer_id: parseInt(farmerId),
+                user_id: farmer.user_id,
+                email: farmer.email,
+                full_name: farmer.full_name,
+                status: 'APPROVED'
+            }
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error approving farmer:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to approve farmer application'
+        });
+    } finally {
+        client.release();
+    }
+});
+
+/**
+ * @route   DELETE /api/auth/admin/reject-farmer/:farmerId
+ * @desc    Reject a farmer application
+ * @access  Admin only
+ */
+app.delete('/api/auth/admin/reject-farmer/:farmerId', authenticateToken, authorizeRole(['ADMIN']), async (req, res) => {
+    console.log('❌ Admin rejecting farmer:', req.params.farmerId);
+
+    const client = await pool.connect();
+
+    try {
+        const { farmerId } = req.params;
+
+        await client.query('BEGIN');
+
+        // Check if farmer exists
+        const farmerCheck = await client.query(
+            `SELECT f.farmer_id, f.user_id, f.verified_status, u.email, u.full_name
+             FROM farmers f
+             JOIN users u ON f.user_id = u.user_id
+             WHERE f.farmer_id = $1`,
+            [farmerId]
+        );
+
+        if (farmerCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({
+                success: false,
+                error: 'Farmer application not found'
+            });
+        }
+
+        const farmer = farmerCheck.rows[0];
+
+        if (farmer.verified_status === true) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                success: false,
+                error: 'Cannot reject an already approved farmer'
+            });
+        }
+
+        // Delete the farmer application
+        await client.query(
+            `DELETE FROM farmers WHERE farmer_id = $1`,
+            [farmerId]
+        );
+
+        // User role remains as CUSTOMER (no change needed)
+
+        await client.query('COMMIT');
+
+        console.log('❌ Farmer application rejected and removed');
+        console.log('   - Farmer ID:', farmerId);
+        console.log('   - User ID:', farmer.user_id);
+        console.log('   - Email:', farmer.email);
+        console.log('   - Name:', farmer.full_name);
+
+        res.json({
+            success: true,
+            message: 'Farmer application rejected successfully',
+            rejected_farmer: {
+                farmer_id: parseInt(farmerId),
+                user_id: farmer.user_id,
+                email: farmer.email,
+                full_name: farmer.full_name
+            }
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error rejecting farmer:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to reject farmer application'
+        });
+    } finally {
+        client.release();
+    }
+});
+
+/**
+ * @route   GET /api/auth/farmer/status
+ * @desc    Check farmer application status
+ * @access  Private (any logged-in user)
+ */
+app.get('/api/auth/farmer/status', authenticateToken, async (req, res) => {
+    console.log('🔍 Checking farmer status for user:', req.user.user_id);
+
+    try {
+        const result = await pool.query(
+            `SELECT 
+                f.farmer_id,
+                f.farm_name,
+                f.barangay as farm_location,
+                f.farm_description,
+                f.verified_status,
+                f.created_at as application_date,
+                f.updated_at
+             FROM farmers f
+             WHERE f.user_id = $1`,
+            [req.user.user_id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.json({
+                success: true,
+                has_application: false,
+                status: 'NOT_REGISTERED',
+                message: 'You have not applied to become a farmer yet'
+            });
+        }
+
+        const farmer = result.rows[0];
+        let status = 'PENDING';
+        let message = '';
+        
+        if (farmer.verified_status === true) {
+            status = 'APPROVED';
+            message = 'Your farmer application has been approved! You now have farmer access.';
+        } else {
+            status = 'PENDING';
+            message = 'Your farmer application is pending admin approval. You will be notified once approved.';
+        }
+
+        res.json({
+            success: true,
+            has_application: true,
+            status: status,
+            farmer: {
+                farmer_id: farmer.farmer_id,
+                farm_name: farmer.farm_name,
+                farm_location: farmer.farm_location,
+                farm_description: farmer.farm_description,
+                application_date: farmer.application_date,
+                message: message
+            }
+        });
+
+    } catch (error) {
+        console.error('Error checking farmer status:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to check farmer application status'
+        });
+    }
+});
+
+/**
+ * @route   GET /api/auth/farmer/profile
+ * @desc    Get farmer profile (only if approved)
+ * @access  Private (Farmer only)
+ */
+app.get('/api/auth/farmer/profile', authenticateToken, authorizeRole(['FARMER']), async (req, res) => {
+    console.log('🌾 Fetching farmer profile for user:', req.user.user_id);
+
+    try {
+        // Check if user is actually a verified farmer
+        const farmerCheck = await pool.query(
+            `SELECT f.farmer_id, f.farm_name, f.barangay as farm_location, 
+                    f.farm_description, f.verified_status, f.created_at, f.updated_at,
+                    u.full_name, u.email, u.contact_number, u.address, u.barangay
+             FROM farmers f
+             JOIN users u ON f.user_id = u.user_id
+             WHERE f.user_id = $1 AND f.verified_status = true`,
+            [req.user.user_id]
+        );
+
+        if (farmerCheck.rows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                error: 'Access denied. Your farmer account has not been verified yet.'
+            });
+        }
+
+        res.json({
+            success: true,
+            farmer: farmerCheck.rows[0]
+        });
+
+    } catch (error) {
+        console.error('Error fetching farmer profile:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch farmer profile'
         });
     }
 });
@@ -1133,13 +1638,19 @@ app.use('*', (req, res) => {
             'POST /api/auth/login',
             'GET /api/auth/profile',
             'PUT /api/auth/update-profile',
-            'POST /api/auth/register-farmer'
+            'POST /api/auth/register-farmer',
+            'GET /api/auth/farmer/status',
+            'GET /api/auth/farmer/profile'
         ],
         admin: [
             'POST /api/auth/create-first-admin',
             'POST /api/auth/admin/register',
             'POST /api/auth/admin/login',
-            'GET /api/auth/admin/users'
+            'GET /api/auth/admin/users',
+            'GET /api/auth/admin/pending-farmers',
+            'GET /api/auth/admin/all-farmers',
+            'PUT /api/auth/admin/approve-farmer/:farmerId',
+            'DELETE /api/auth/admin/reject-farmer/:farmerId'
         ],
         products: [
             'GET /api/products',

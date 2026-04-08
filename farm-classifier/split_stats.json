@@ -1,21 +1,27 @@
 {
   "crops": {
-    "total": 5,
-    "train": 3,
-    "val": 0,
-    "test": 2
+    "total": 47,
+    "train": 32,
+    "val": 7,
+    "test": 8
   },
   "fruits": {
-    "total": 10,
-    "train": 7,
-    "val": 1,
-    "test": 2
+    "total": 47,
+    "train": 32,
+    "val": 7,
+    "test": 8
   },
   "rice": {
     "total": 15,
     "train": 10,
     "val": 2,
     "test": 3
+  },
+  "unknown": {
+    "total": 73,
+    "train": 51,
+    "val": 10,
+    "test": 12
   },
   "vegetables": {
     "total": 36,
