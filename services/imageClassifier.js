@@ -1,10 +1,16 @@
 const axios = require('axios');
 const FormData = require('form-data');
+const path = require('path');
+const fs = require('fs');
+
+// Get from environment variables
+const CLASSIFIER_URL = process.env.CLASSIFIER_URL || 'http://localhost:5002';
+const CLASSIFIER_TIMEOUT = parseInt(process.env.CLASSIFIER_TIMEOUT) || 30000;
 
 class ImageClassifier {
     constructor() {
-        this.classifierUrl = 'http://localhost:5002';
-        this.timeout = 30000; // 30 seconds timeout
+        this.classifierUrl = CLASSIFIER_URL;
+        this.timeout = CLASSIFIER_TIMEOUT;
     }
 
     async healthCheck() {
@@ -39,7 +45,6 @@ class ImageClassifier {
     }
 
     async classifyFromPath(imagePath) {
-        const fs = require('fs');
         const imageBuffer = fs.readFileSync(imagePath);
         return this.classifyImage(imageBuffer, path.basename(imagePath));
     }

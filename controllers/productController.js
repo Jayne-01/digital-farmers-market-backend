@@ -339,16 +339,8 @@ const getAllProducts = async (req, res) => {
                 f.farm_name,
                 f.barangay,
                 u.full_name as farmer_name,
-                COALESCE((
-                    SELECT AVG(fb.rating)::numeric(10,2)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as avg_rating,
-                COALESCE((
-                    SELECT COUNT(*)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as review_count
+                COALESCE((SELECT AVG(fb.rating)::numeric(10,2) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as avg_rating,
+                COALESCE((SELECT COUNT(*) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
@@ -464,16 +456,8 @@ const searchProducts = async (req, res) => {
                 f.farm_name,
                 f.barangay,
                 u.full_name as farmer_name,
-                COALESCE((
-                    SELECT AVG(fb.rating)::numeric(10,2)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as avg_rating,
-                COALESCE((
-                    SELECT COUNT(*)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as review_count
+                COALESCE((SELECT AVG(fb.rating)::numeric(10,2) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as avg_rating,
+                COALESCE((SELECT COUNT(*) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
@@ -541,16 +525,8 @@ const getProductsByCategory = async (req, res) => {
                 f.farm_name,
                 f.barangay,
                 u.full_name as farmer_name,
-                COALESCE((
-                    SELECT AVG(fb.rating)::numeric(10,2)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as avg_rating,
-                COALESCE((
-                    SELECT COUNT(*)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as review_count
+                COALESCE((SELECT AVG(fb.rating)::numeric(10,2) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as avg_rating,
+                COALESCE((SELECT COUNT(*) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
@@ -632,16 +608,8 @@ const getProductsByFarmerId = async (req, res) => {
                 f.farm_name,
                 f.barangay,
                 u.full_name as farmer_name,
-                COALESCE((
-                    SELECT AVG(fb.rating)::numeric(10,2)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as avg_rating,
-                COALESCE((
-                    SELECT COUNT(*)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as review_count
+                COALESCE((SELECT AVG(fb.rating)::numeric(10,2) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as avg_rating,
+                COALESCE((SELECT COUNT(*) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
@@ -729,16 +697,8 @@ const getProductById = async (req, res) => {
                 f.farm_name,
                 f.barangay,
                 u.full_name as farmer_name,
-                COALESCE((
-                    SELECT AVG(fb.rating)::numeric(10,2)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as avg_rating,
-                COALESCE((
-                    SELECT COUNT(*)
-                    FROM feedback fb 
-                    WHERE fb.product_id = p.product_id
-                ), 0) as review_count
+                COALESCE((SELECT AVG(fb.rating)::numeric(10,2) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as avg_rating,
+                COALESCE((SELECT COUNT(*) FROM feedback fb WHERE fb.product_id = p.product_id), 0) as review_count
             FROM products p
             JOIN farmers f ON p.farmer_id = f.farmer_id
             JOIN users u ON f.user_id = u.user_id
@@ -779,6 +739,7 @@ const getProductById = async (req, res) => {
     }
 };
 
+// ========== CREATE PRODUCT - NO PRICE ROUNDING ==========
 // Create new product (farmer only)
 const createProduct = async (req, res) => {
     try {
@@ -796,7 +757,10 @@ const createProduct = async (req, res) => {
         const farmer_id = farmerResult.rows[0].farmer_id;
         const { product_name, category, price, unit, stock, harvest_date, description } = req.body;
         
-        console.log('Received data:', { product_name, category, price, unit, stock, harvest_date, description });
+        // NO PRICE ROUNDING - Keep exact value as entered
+        const exactPrice = parseFloat(price);
+        
+        console.log('Received data:', { product_name, category, price: exactPrice, unit, stock, harvest_date, description });
         
         // Validate required fields
         if (!product_name || !category || !price || !unit || stock === undefined) {
@@ -829,7 +793,7 @@ const createProduct = async (req, res) => {
             RETURNING *
         `;
 
-        const values = [farmer_id, product_name, category, price, unit, stock, harvest_date || null, description || null, image_url];
+        const values = [farmer_id, product_name, category, exactPrice, unit, stock, harvest_date || null, description || null, image_url];
         const result = await db.query(query, values);
         
         console.log('Product created:', result.rows[0]);
@@ -850,6 +814,7 @@ const createProduct = async (req, res) => {
     }
 };
 
+// ========== UPDATE PRODUCT - NO PRICE ROUNDING ==========
 // Update product (farmer only)
 const updateProduct = async (req, res) => {
     try {
@@ -892,12 +857,17 @@ const updateProduct = async (req, res) => {
         // Get values from request body
         const product_name = req.body.product_name;
         const category = req.body.category;
-        const price = req.body.price;
+        let price = req.body.price;
         const unit = req.body.unit;
         const stock = req.body.stock;
         const harvest_date = req.body.harvest_date;
         const description = req.body.description;
         const status = req.body.status;
+        
+        // NO PRICE ROUNDING - Keep exact value as entered
+        if (price !== undefined) {
+            price = parseFloat(price);
+        }
         
         console.log('Extracted values:', {
             product_name,

@@ -701,9 +701,11 @@ router.patch('/orders/:id', authenticateToken, authorizeRole('ADMIN'), async (re
 });
 
 // ========== SETTINGS MANAGEMENT ==========
+// ========== SETTINGS MANAGEMENT ==========
 // GET /api/admin/settings - Get system settings
 router.get('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
+        // Check if system_settings table exists
         const checkTable = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -712,6 +714,7 @@ router.get('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
         `);
         
         if (!checkTable.rows[0].exists) {
+            // Return default settings if table doesn't exist
             return res.json({
                 success: true,
                 settings: {
@@ -724,13 +727,20 @@ router.get('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
             });
         }
         
-        const query = 'SELECT * FROM system_settings LIMIT 1';
-        const result = await pool.query(query);
+        // Get settings from database
+        const result = await pool.query('SELECT * FROM system_settings LIMIT 1');
         
         if (result.rows.length === 0) {
+            // Return default settings if no row exists
             return res.json({
                 success: true,
-                settings: {}
+                settings: {
+                    platform_name: 'Digital Farmers Market',
+                    support_email: 'support@digitalfarmers.com',
+                    support_phone: '09123456789',
+                    cod_enabled: true,
+                    maintenance_mode: false
+                }
             });
         }
         
@@ -738,9 +748,20 @@ router.get('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
             success: true,
             settings: result.rows[0]
         });
+        
     } catch (error) {
         console.error('Error fetching settings:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ 
+            success: false, 
+            error: error.message,
+            settings: {
+                platform_name: 'Digital Farmers Market',
+                support_email: 'support@digitalfarmers.com',
+                support_phone: '09123456789',
+                cod_enabled: true,
+                maintenance_mode: false
+            }
+        });
     }
 });
 
@@ -749,6 +770,7 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
     try {
         const { settings } = req.body;
         
+        // Check if system_settings table exists
         const checkTable = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -757,24 +779,27 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
         `);
         
         if (!checkTable.rows[0].exists) {
+            // Create the table if it doesn't exist
             await pool.query(`
                 CREATE TABLE system_settings (
                     id SERIAL PRIMARY KEY,
-                    platform_name VARCHAR(255),
-                    support_email VARCHAR(255),
-                    support_phone VARCHAR(50),
+                    platform_name VARCHAR(255) DEFAULT 'Digital Farmers Market',
+                    support_email VARCHAR(255) DEFAULT 'support@digitalfarmers.com',
+                    support_phone VARCHAR(50) DEFAULT '09123456789',
                     cod_enabled BOOLEAN DEFAULT true,
                     maintenance_mode BOOLEAN DEFAULT false,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_by INT
-                );
+                )
             `);
         }
         
+        // Check if settings row exists
         const checkSettings = await pool.query('SELECT COUNT(*) FROM system_settings');
         
         let result;
         if (parseInt(checkSettings.rows[0].count) > 0) {
+            // Update existing settings
             const query = `
                 UPDATE system_settings 
                 SET platform_name = $1,
@@ -795,6 +820,7 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
                 req.user.id
             ]);
         } else {
+            // Insert new settings
             const query = `
                 INSERT INTO system_settings 
                 (platform_name, support_email, support_phone, cod_enabled, maintenance_mode, updated_by)
@@ -813,11 +839,16 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
         
         res.json({
             success: true,
+            message: 'Settings updated successfully',
             settings: result.rows[0]
         });
+        
     } catch (error) {
         console.error('Error updating settings:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
     }
 });
 
@@ -866,4 +897,35 @@ router.get('/settings/logs', authenticateToken, authorizeRole('ADMIN'), async (r
     }
 });
 
+// GET /api/maintenance-status - Public endpoint to check maintenance status
+// ========== MAINTENANCE STATUS (PUBLIC) ==========
+// GET /api/maintenance-status - Public endpoint for frontend to check maintenance mode
+router.get('/maintenance-status', async (req, res) => {
+    try {
+        console.log('🔧 Maintenance status check...');
+        
+        // Check if system_settings table exists
+        const tableCheck = await pool.query(`
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'system_settings'
+            );
+        `);
+        
+        if (!tableCheck.rows[0].exists) {
+            console.log('📋 system_settings table not found, maintenance_mode = false');
+            return res.json({ maintenance_mode: false });
+        }
+        
+        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
+        const maintenance_mode = result.rows[0]?.maintenance_mode === true;
+        
+        console.log(`🔧 Maintenance mode is: ${maintenance_mode ? 'ON' : 'OFF'}`);
+        res.json({ maintenance_mode });
+        
+    } catch (error) {
+        console.error('❌ Maintenance status error:', error);
+        res.json({ maintenance_mode: false });
+    }
+});
 module.exports = router;

@@ -5,6 +5,8 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -60,7 +62,197 @@ pool.on('error', (err) => {
     process.exit(-1);
 });
 
-// Middleware
+// ========== GOOGLE OAUTH SETUP ==========
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/auth/google/callback`,
+    passReqToCallback: true
+  },
+  async (req, accessToken, refreshToken, profile, done) => {
+    try {
+      console.log('🔍 Google profile received:', profile.emails[0].value);
+      console.log('📛 Display name:', profile.displayName);
+      
+      // Check if user exists
+      const existingUser = await pool.query(
+        'SELECT * FROM users WHERE email = $1',
+        [profile.emails[0].value]
+      );
+
+      let user;
+      let isNewUser = false;
+
+      if (existingUser.rows.length === 0) {
+        // Create new user
+        isNewUser = true;
+        console.log('📝 Creating new user from Google account');
+        
+        const result = await pool.query(
+          `INSERT INTO users (
+            full_name, 
+            email, 
+            role, 
+            contact_number, 
+            address, 
+            barangay, 
+            status, 
+            google_id, 
+            created_at, 
+            updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+          RETURNING user_id, full_name, email, role, contact_number, address, barangay, status, created_at`,
+          [
+            profile.displayName,
+            profile.emails[0].value,
+            'CUSTOMER',  // Default role (they can register as farmer later)
+            null,
+            null,
+            null,
+            'ACTIVE',
+            profile.id
+          ]
+        );
+        user = result.rows[0];
+        user.isNewUser = true;
+      } else {
+        user = existingUser.rows[0];
+        user.isNewUser = false;
+        console.log('📋 Existing user found:', user.email);
+        
+        // Update google_id if not set
+        if (!user.google_id) {
+          await pool.query(
+            'UPDATE users SET google_id = $1, updated_at = NOW() WHERE user_id = $2',
+            [profile.id, user.user_id]
+          );
+          console.log('🔄 Updated user with google_id');
+        }
+      }
+
+      // Generate JWT token (same as your login)
+      const token = jwt.sign(
+        { 
+          user_id: user.user_id, 
+          email: user.email, 
+          role: user.role,
+          id: user.user_id
+        },
+        process.env.JWT_SECRET || 'your-secret-key-change-in-production',
+        { expiresIn: '7d' }
+      );
+
+      console.log('✅ Google authentication successful for:', user.email);
+      return done(null, { user, token, isNewUser });
+      
+    } catch (error) {
+      console.error('❌ Google Strategy Error:', error);
+      return done(error, null);
+    }
+  }
+));
+
+passport.serializeUser((userData, done) => done(null, userData));
+passport.deserializeUser((obj, done) => done(null, obj));
+
+// ========== MAINTENANCE STATUS ENDPOINT (PUBLIC) - MUST BE BEFORE MIDDLEWARE ==========
+// GET /api/maintenance-status - Public endpoint for frontend to check maintenance mode
+app.get('/api/maintenance-status', async (req, res) => {
+    try {
+        console.log('🔧 Maintenance status check...');
+        
+        // Check if system_settings table exists
+        const tableCheck = await pool.query(`
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'system_settings'
+            );
+        `);
+        
+        if (!tableCheck.rows[0].exists) {
+            console.log('📋 system_settings table not found, maintenance_mode = false');
+            return res.json({ maintenance_mode: false });
+        }
+        
+        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
+        const maintenance_mode = result.rows[0]?.maintenance_mode === true;
+        
+        console.log(`🔧 Maintenance mode is: ${maintenance_mode ? 'ON' : 'OFF'}`);
+        res.json({ maintenance_mode });
+        
+    } catch (error) {
+        console.error('❌ Maintenance status error:', error);
+        res.json({ maintenance_mode: false });
+    }
+});
+
+// ========== MAINTENANCE MODE MIDDLEWARE ==========
+// This middleware blocks non-admin users when maintenance mode is ON
+async function maintenanceMiddleware(req, res, next) {
+    // Skip for admin routes (both API and HTML pages), auth routes, maintenance status, static files
+    const skipPaths = [
+        '/api/admin',
+        '/api/maintenance-status',
+        '/api/auth/admin/login',  // Add this line - allows admin login API
+        '/api/auth/login',  
+        '/admin',
+        '/maintenance.html',
+        '/auth/login.html',
+        '/auth/register.html'
+    ];
+    
+    const shouldSkip = skipPaths.some(path => req.path.startsWith(path)) ||
+                       req.path.endsWith('.css') ||
+                       req.path.endsWith('.js') ||
+                       req.path.endsWith('.png') ||
+                       req.path.endsWith('.jpg') ||
+                       req.path.endsWith('.svg') ||
+                       req.path.endsWith('.ico') ||
+                       req.path.endsWith('.woff') ||
+                       req.path.endsWith('.woff2') ||
+                       req.path.endsWith('.ttf');
+    
+    if (shouldSkip) {
+        return next();
+    }
+    
+    try {
+        // Check if system_settings table exists
+        const tableCheck = await pool.query(`
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'system_settings'
+            );
+        `);
+        
+        if (!tableCheck.rows[0].exists) {
+            return next();
+        }
+        
+        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
+        const isMaintenanceMode = result.rows[0]?.maintenance_mode === true;
+        
+        if (isMaintenanceMode) {
+            // Check if request expects JSON
+            if (req.headers.accept && req.headers.accept.includes('application/json')) {
+                return res.status(503).json({ 
+                    success: false, 
+                    error: 'Site is under maintenance. Please try again later.',
+                    maintenance: true
+                });
+            }
+            // For all other HTML requests, redirect to maintenance page
+            return res.redirect('/maintenance.html');
+        }
+        
+        next();
+    } catch (error) {
+        console.error('Maintenance middleware error:', error);
+        next();
+    }
+}
+
+// ========== MIDDLEWARE ==========
 app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
@@ -76,10 +268,14 @@ app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(morgan('dev'));
+app.use(passport.initialize());
 
-// Static files
+// Static files - MUST be before maintenance middleware
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use(express.static('C:/Users/Jorinna/OneDrive/Desktop/digital-farmers-market-frontend'));
+
+// Apply maintenance middleware AFTER static files
+app.use(maintenanceMiddleware);
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -451,6 +647,41 @@ app.post('/api/auth/login', async (req, res) => {
         });
     }
 });
+
+// ========== GOOGLE OAUTH ROUTES ==========
+
+/**
+ * @route   GET /api/auth/google
+ * @desc    Initiate Google Sign-In
+ * @access  Public
+ */
+app.get('/api/auth/google',
+  passport.authenticate('google', { 
+    scope: ['profile', 'email'],
+    session: false 
+  })
+);
+
+/**
+ * @route   GET /api/auth/google/callback
+ * @desc    Google OAuth Callback
+ * @access  Public
+ */
+app.get('/api/auth/google/callback',
+  passport.authenticate('google', { 
+    failureRedirect: `${process.env.FRONTEND_URL || 'http://localhost:3000'}/login?error=google_auth_failed`,
+    session: false 
+  }),
+  (req, res) => {
+    const { token, user, isNewUser } = req.user;
+    
+    // Redirect to frontend callback page
+    const redirectUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/auth-callback.html?token=${token}&role=${user.role}&name=${encodeURIComponent(user.full_name)}&email=${encodeURIComponent(user.email)}&isNewUser=${isNewUser}`;
+    
+    console.log('🔄 Redirecting to:', redirectUrl);
+    res.redirect(redirectUrl);
+  }
+);
 
 /**
  * @route   GET /api/auth/profile
@@ -1636,6 +1867,8 @@ app.use('*', (req, res) => {
         auth: [
             'POST /api/auth/register',
             'POST /api/auth/login',
+            'GET /api/auth/google',
+            'GET /api/auth/google/callback',
             'GET /api/auth/profile',
             'PUT /api/auth/update-profile',
             'POST /api/auth/register-farmer',
@@ -1689,7 +1922,8 @@ app.use('*', (req, res) => {
             'POST /api/validate-product'
         ],
         other: [
-            'GET /health'
+            'GET /health',
+            'GET /api/maintenance-status'
         ]
     };
     
@@ -1714,6 +1948,8 @@ const server = app.listen(PORT, HOST, () => {
     console.log(`🕒 Started at:      ${new Date().toLocaleString()}`);
     console.log(`🔧 Environment:     ${process.env.NODE_ENV || 'development'}`);
     console.log(`💾 Database:        Digital-Farm-Market on ${process.env.DB_HOST || 'localhost'}`);
+    console.log(`🔐 Google OAuth:    ${process.env.GOOGLE_CLIENT_ID ? '✅ Configured' : '❌ Not configured'}`);
+    console.log(`🔧 Maintenance API: http://${HOST}:${PORT}/api/maintenance-status`);
     console.log('='.repeat(70) + '\n');
 });
 

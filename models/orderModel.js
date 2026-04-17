@@ -2,7 +2,7 @@
 const db = require('../config/database');
 
 class Order {
-    // Create a new order (for direct purchase - without cart)
+    // Create a new order
     static async create(orderData) {
         const { 
             customer_id, 
@@ -13,8 +13,6 @@ class Order {
             contact_number,
             payment_method
         } = orderData;
-        
-        console.log('Order.create called with:', orderData);
         
         try {
             const query = `
@@ -44,36 +42,26 @@ class Order {
                 'PENDING'
             ];
             
-            console.log('Executing query with values:', values);
-            console.log('Number of values:', values.length); 
-            
             const result = await db.query(query, values);
-            console.log('Query result:', result.rows[0]);
-            
             return result.rows[0];
             
         } catch (error) {
             console.error('Error in Order.create:', error);
-            console.error('Error details:', {
-                message: error.message,
-                code: error.code,
-                position: error.position
-            });
             throw error;
         }
     }
 
-    // Add item to an order
+    // Add item to an order - WITH product_name_snapshot AND product_image_snapshot
     static async addOrderItem(order_id, itemData) {
-        const { product_id, quantity, price } = itemData;
+        const { product_id, quantity, price, product_name, product_image } = itemData;
         
         try {
             const query = `
-                INSERT INTO order_items (order_id, product_id, quantity, price)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO order_items (order_id, product_id, product_name_snapshot, product_image_snapshot, quantity, price)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING *
             `;
-            const result = await db.query(query, [order_id, product_id, quantity, price]);
+            const result = await db.query(query, [order_id, product_id, product_name, product_image, quantity, price]);
             return result.rows[0];
         } catch (error) {
             console.error('Error in Order.addOrderItem:', error);
@@ -82,28 +70,43 @@ class Order {
     }
 
     // Find orders by customer
-static async findByCustomer(customer_id) {
-    try {
-        const query = `
-            SELECT 
-                o.*,
-                f.farm_name,
-                u.full_name as farmer_name,
-                u.contact_number as farmer_contact
-            FROM orders o
-            JOIN farmers f ON o.farmer_id = f.farmer_id
-            JOIN users u ON f.user_id = u.user_id
-            WHERE o.customer_id = $1
-            ORDER BY o.order_date DESC
-        `;
-        const result = await db.query(query, [customer_id]);
-        console.log(`Found ${result.rows.length} orders for customer ${customer_id}`); 
-        return result.rows;
-    } catch (error) {
-        console.error('Error in Order.findByCustomer:', error);
-        throw error;
+    static async findByCustomer(customer_id) {
+        try {
+            const query = `
+                SELECT 
+                    o.*,
+                    f.farm_name,
+                    u.full_name as farmer_name,
+                    u.contact_number as farmer_contact,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'product_id', oi.product_id,
+                                'product_name', COALESCE(oi.product_name_snapshot, p.product_name, 'Product #' || oi.product_id),
+                                'product_image', COALESCE(oi.product_image_snapshot, p.image_url, ''),
+                                'quantity', oi.quantity,
+                                'price', oi.price,
+                                'is_deleted', CASE WHEN p.product_id IS NULL THEN true ELSE false END
+                            ) ORDER BY oi.order_item_id
+                        ) FILTER (WHERE oi.product_id IS NOT NULL), 
+                        '[]'::json
+                    ) as items
+                FROM orders o
+                LEFT JOIN order_items oi ON o.order_id = oi.order_id
+                LEFT JOIN products p ON oi.product_id = p.product_id
+                JOIN farmers f ON o.farmer_id = f.farmer_id
+                JOIN users u ON f.user_id = u.user_id
+                WHERE o.customer_id = $1
+                GROUP BY o.order_id, f.farm_name, u.full_name, u.contact_number
+                ORDER BY o.order_date DESC
+            `;
+            const result = await db.query(query, [customer_id]);
+            return result.rows;
+        } catch (error) {
+            console.error('Error in Order.findByCustomer:', error);
+            throw error;
+        }
     }
-}
 
     // Find orders by farmer
     static async findByFarmer(farmer_id) {
@@ -113,10 +116,26 @@ static async findByCustomer(customer_id) {
                     o.*,
                     u.full_name as customer_name,
                     u.contact_number,
-                    u.address
+                    u.address,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'product_id', oi.product_id,
+                                'product_name', COALESCE(oi.product_name_snapshot, p.product_name, 'Product #' || oi.product_id),
+                                'product_image', COALESCE(oi.product_image_snapshot, p.image_url, ''),
+                                'quantity', oi.quantity,
+                                'price', oi.price,
+                                'is_deleted', CASE WHEN p.product_id IS NULL THEN true ELSE false END
+                            ) ORDER BY oi.order_item_id
+                        ) FILTER (WHERE oi.product_id IS NOT NULL), 
+                        '[]'::json
+                    ) as items
                 FROM orders o
+                LEFT JOIN order_items oi ON o.order_id = oi.order_id
+                LEFT JOIN products p ON oi.product_id = p.product_id
                 JOIN users u ON o.customer_id = u.user_id
                 WHERE o.farmer_id = $1
+                GROUP BY o.order_id, u.full_name, u.contact_number, u.address
                 ORDER BY o.order_date DESC
             `;
             const result = await db.query(query, [farmer_id]);
@@ -138,12 +157,28 @@ static async findByCustomer(customer_id) {
                     u.address as customer_address,
                     f.farm_name,
                     fu.full_name as farmer_name,
-                    fu.contact_number as farmer_contact
+                    fu.contact_number as farmer_contact,
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'product_id', oi.product_id,
+                                'product_name', COALESCE(oi.product_name_snapshot, p.product_name, 'Product #' || oi.product_id),
+                                'product_image', COALESCE(oi.product_image_snapshot, p.image_url, ''),
+                                'quantity', oi.quantity,
+                                'price', oi.price,
+                                'is_deleted', CASE WHEN p.product_id IS NULL THEN true ELSE false END
+                            ) ORDER BY oi.order_item_id
+                        ) FILTER (WHERE oi.product_id IS NOT NULL), 
+                        '[]'::json
+                    ) as items
                 FROM orders o
+                LEFT JOIN order_items oi ON o.order_id = oi.order_id
+                LEFT JOIN products p ON oi.product_id = p.product_id
                 JOIN users u ON o.customer_id = u.user_id
                 JOIN farmers f ON o.farmer_id = f.farmer_id
                 JOIN users fu ON f.user_id = fu.user_id
                 WHERE o.order_id = $1
+                GROUP BY o.order_id, u.full_name, u.contact_number, u.address, f.farm_name, fu.full_name, fu.contact_number
             `;
             const result = await db.query(query, [order_id]);
             return result.rows[0];
@@ -159,11 +194,12 @@ static async findByCustomer(customer_id) {
             const query = `
                 SELECT 
                     oi.*,
-                    p.product_name,
+                    COALESCE(oi.product_name_snapshot, p.product_name, 'Product #' || oi.product_id) as product_name,
+                    COALESCE(oi.product_image_snapshot, p.image_url, '') as product_image,
                     p.category,
-                    p.image_url
+                    CASE WHEN p.product_id IS NULL THEN true ELSE false END as is_deleted
                 FROM order_items oi
-                JOIN products p ON oi.product_id = p.product_id
+                LEFT JOIN products p ON oi.product_id = p.product_id
                 WHERE oi.order_id = $1
             `;
             const result = await db.query(query, [order_id]);

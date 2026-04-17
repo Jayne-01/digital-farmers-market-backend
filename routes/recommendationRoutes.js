@@ -66,7 +66,6 @@ router.get('/farm-performance', authenticateToken, authorizeRole('FARMER'), asyn
         `, [farmerId]);
         
         console.log(`Found ${farmerProducts.rows.length} products`);
-        console.log('Products:', farmerProducts.rows.map(p => p.product_name));
         
         // Calculate totals
         const totalProducts = farmerProducts.rows.length;
@@ -235,7 +234,7 @@ router.get('/what-to-sell', authenticateToken, async (req, res) => {
     }
 });
 
-// ===================== 4. PERSONALIZED INSIGHTS (FIXED) =====================
+// ===================== 4. PERSONALIZED INSIGHTS =====================
 router.get('/personalized-insights', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
     try {
         const userId = req.user.user_id || req.user.id;
@@ -249,6 +248,7 @@ router.get('/personalized-insights', authenticateToken, authorizeRole('FARMER'),
             return res.json({
                 success: true,
                 recommendations: [],
+                price_drop_recommendations: [],
                 farmer_summary: {
                     total_products: 0,
                     products_grown: [],
@@ -343,32 +343,229 @@ router.get('/personalized-insights', authenticateToken, authorizeRole('FARMER'),
         recommendations.sort((a, b) => b.demand_score - a.demand_score);
         
         // ACCURATE COUNTS
-        const farmerActualProducts = farmerProducts.rows.length; // Farmer's actual products
+        const farmerActualProducts = farmerProducts.rows.length;
         const existingCount = recommendations.filter(r => r.type === 'existing').length;
         const highPriorityCount = recommendations.filter(r => r.demand_score >= 7).length;
         const newOpportunitiesCount = recommendations.filter(r => r.type === 'new' && r.demand_score >= 7).length;
         
-        console.log('=== ACCURATE COUNTS ===');
-        console.log('Farmer Actual Products:', farmerActualProducts);
-        console.log('Existing Products in Market:', existingCount);
-        console.log('High Priority (score >= 7):', highPriorityCount);
-        console.log('New Opportunities (new + score >= 7):', newOpportunitiesCount);
+        // ===================== NEW: PRICE DROP RECOMMENDATIONS =====================
+        const priceDropRecommendations = await getPriceDropRecommendations(farmerId, farmerProducts.rows);
         
         res.json({
             success: true,
             recommendations: recommendations,
+            price_drop_recommendations: priceDropRecommendations,
             farmer_summary: {
-                total_products: farmerActualProducts,  // Farmer's actual product count
+                total_products: farmerActualProducts,
                 products_grown: farmerProducts.rows.map(p => p.product_name),
                 existing_count: existingCount,
                 high_priority_count: highPriorityCount,
                 new_opportunities_count: newOpportunitiesCount,
-                total_recommendations: recommendations.length
+                total_recommendations: recommendations.length,
+                products_with_competition: priceDropRecommendations.length
             }
         });
         
     } catch (error) {
         console.error('Personalized insights error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ===================== NEW: PRICE DROP RECOMMENDATIONS =====================
+async function getPriceDropRecommendations(farmerId, farmerProducts) {
+    try {
+        const priceRecommendations = [];
+        
+        for (const product of farmerProducts) {
+            // Find all other farmers selling the same product
+            const competitorQuery = await pool.query(`
+                SELECT 
+                    p.product_id,
+                    p.product_name,
+                    p.price,
+                    p.farmer_id,
+                    f.farm_name,
+                    COALESCE(
+                        (SELECT SUM(oi.quantity) 
+                         FROM order_items oi 
+                         JOIN orders o ON oi.order_id = o.order_id 
+                         WHERE oi.product_id = p.product_id 
+                         AND o.order_status = 'DELIVERED'
+                        ), 0
+                    ) as total_sold
+                FROM products p
+                JOIN farmers f ON p.farmer_id = f.farmer_id
+                WHERE LOWER(TRIM(p.product_name)) = LOWER(TRIM($1))
+                AND p.farmer_id != $2
+                AND f.verified_status = true
+                ORDER BY p.price ASC
+            `, [product.product_name, farmerId]);
+            
+            if (competitorQuery.rows.length > 0) {
+                const lowestPrice = Math.min(...competitorQuery.rows.map(c => parseFloat(c.price)));
+                const currentPrice = parseFloat(product.price);
+                const priceDifference = currentPrice - lowestPrice;
+                const priceDifferencePercent = (priceDifference / currentPrice) * 100;
+                
+                // Check if current price is higher than competitors
+                if (priceDifference > 0) {
+                    // Calculate suggested price (slightly above lowest price, or match it)
+                    let suggestedPrice = lowestPrice;
+                    let suggestionType = '';
+                    let urgency = '';
+                    
+                    if (priceDifferencePercent > 20) {
+                        suggestionType = '⚠️ SIGNIFICANTLY OVERPRICED';
+                        urgency = 'high';
+                        suggestedPrice = lowestPrice + (lowestPrice * 0.05); // 5% above lowest
+                    } else if (priceDifferencePercent > 10) {
+                        suggestionType = '📉 Overpriced';
+                        urgency = 'medium';
+                        suggestedPrice = lowestPrice + (lowestPrice * 0.03); // 3% above lowest
+                    } else {
+                        suggestionType = '💰 Slightly higher than competitors';
+                        urgency = 'low';
+                        suggestedPrice = lowestPrice;
+                    }
+                    
+                    // Round to 2 decimal places
+                    suggestedPrice = Math.round(suggestedPrice * 100) / 100;
+                    const newPriceDifference = currentPrice - suggestedPrice;
+                    const potentialSalesLoss = Math.round(competitorQuery.rows.reduce((sum, c) => sum + parseInt(c.total_sold), 0) * (priceDifferencePercent / 100));
+                    
+                    priceRecommendations.push({
+                        product_id: product.product_id,
+                        product_name: product.product_name,
+                        current_price: currentPrice,
+                        lowest_competitor_price: lowestPrice,
+                        suggested_price: suggestedPrice,
+                        price_difference: priceDifference,
+                        price_difference_percent: Math.round(priceDifferencePercent * 10) / 10,
+                        competitors_count: competitorQuery.rows.length,
+                        competitors: competitorQuery.rows.map(c => ({
+                            farm_name: c.farm_name,
+                            price: parseFloat(c.price),
+                            total_sold: parseInt(c.total_sold)
+                        })),
+                        recommendation: suggestionType,
+                        urgency: urgency,
+                        action_message: suggestionType === '⚠️ SIGNIFICANTLY OVERPRICED' 
+                            ? `🔥 Reduce price from ₱${currentPrice} to ₱${suggestedPrice} to stay competitive!` 
+                            : suggestionType === '📉 Overpriced'
+                            ? `📉 Consider lowering from ₱${currentPrice} to ₱${suggestedPrice}`
+                            : `💡 Small adjustment from ₱${currentPrice} to ₱${suggestedPrice} recommended`,
+                        estimated_sales_impact: potentialSalesLoss > 0 
+                            ? `You may be losing approximately ${potentialSalesLoss} sales to competitors`
+                            : 'Price gap is small, but adjustment could help'
+                    });
+                }
+            }
+        }
+        
+        // Sort by urgency: high first, then by price difference percent
+        const urgencyOrder = { high: 0, medium: 1, low: 2 };
+        priceRecommendations.sort((a, b) => {
+            if (urgencyOrder[a.urgency] !== urgencyOrder[b.urgency]) {
+                return urgencyOrder[a.urgency] - urgencyOrder[b.urgency];
+            }
+            return b.price_difference_percent - a.price_difference_percent;
+        });
+        
+        return priceRecommendations;
+        
+    } catch (error) {
+        console.error('Error getting price drop recommendations:', error);
+        return [];
+    }
+}
+
+// ===================== NEW: SINGLE PRODUCT PRICE CHECK =====================
+router.get('/check-price/:productId', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
+    try {
+        const { productId } = req.params;
+        const userId = req.user.user_id || req.user.id;
+        
+        // Get farmer_id
+        const farmerQuery = await pool.query(`
+            SELECT farmer_id FROM farmers WHERE user_id = $1
+        `, [userId]);
+        
+        if (farmerQuery.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Farmer not found' });
+        }
+        
+        const farmerId = farmerQuery.rows[0].farmer_id;
+        
+        // Get the product
+        const productQuery = await pool.query(`
+            SELECT product_id, product_name, price
+            FROM products
+            WHERE product_id = $1 AND farmer_id = $2
+        `, [productId, farmerId]);
+        
+        if (productQuery.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Product not found' });
+        }
+        
+        const product = productQuery.rows[0];
+        
+        // Get competitors
+        const recommendations = await getPriceDropRecommendations(farmerId, [product]);
+        
+        res.json({
+            success: true,
+            product: product,
+            price_analysis: recommendations.length > 0 ? recommendations[0] : {
+                message: 'No competitors found for this product',
+                current_price: parseFloat(product.price),
+                is_competitive: true
+            }
+        });
+        
+    } catch (error) {
+        console.error('Price check error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ===================== NEW: BULK PRICE UPDATE SUGGESTION =====================
+router.post('/apply-price-suggestion', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
+    const { productId, suggestedPrice } = req.body;
+    const userId = req.user.user_id || req.user.id;
+    
+    try {
+        // Get farmer_id
+        const farmerQuery = await pool.query(`
+            SELECT farmer_id FROM farmers WHERE user_id = $1
+        `, [userId]);
+        
+        if (farmerQuery.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Farmer not found' });
+        }
+        
+        const farmerId = farmerQuery.rows[0].farmer_id;
+        
+        // Update product price
+        const updateQuery = await pool.query(`
+            UPDATE products
+            SET price = $1, updated_at = NOW()
+            WHERE product_id = $2 AND farmer_id = $3
+            RETURNING product_id, product_name, price
+        `, [suggestedPrice, productId, farmerId]);
+        
+        if (updateQuery.rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Product not found' });
+        }
+        
+        res.json({
+            success: true,
+            message: 'Price updated successfully!',
+            product: updateQuery.rows[0]
+        });
+        
+    } catch (error) {
+        console.error('Apply price suggestion error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });

@@ -9,19 +9,25 @@ import json
 import io
 from PIL import Image
 import base64
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Get configuration from .env
+PORT = int(os.getenv('PORT', 5002))
+HOST = os.getenv('HOST', '0.0.0.0')
+DEBUG = os.getenv('DEBUG', 'True').lower() == 'true'
+MODEL_PATH = os.getenv('MODEL_PATH', 'models/farm_classifier.h5')
+CLASS_NAMES_PATH = os.getenv('CLASS_NAMES_PATH', 'models/class_names.json')
+UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads')
+ALLOWED_EXTENSIONS = set(os.getenv('ALLOWED_EXTENSIONS', 'png,jpg,jpeg,gif,bmp').split(','))
 
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
-
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# Model paths
-MODEL_PATH = 'models/farm_classifier.h5'
-CLASS_NAMES_PATH = 'models/class_names.json'
 
 # Load model
 model = None
@@ -181,11 +187,6 @@ if __name__ == '__main__':
     print("=" * 50)
     print(f"Model loaded: {model_loaded}")
     print(f"Classes: {class_names}")
-    print("\nStarting server on http://localhost:5002")
-    print("Endpoints:")
-    print("  GET  /classify/health       - Health check")
-    print("  GET  /classify/classes      - Get available classes")
-    print("  POST /classify/predict      - Predict from file upload")
-    print("  POST /classify/predict-base64 - Predict from base64")
+    print(f"Server: http://{HOST}:{PORT}")
     print("=" * 50)
-    app.run(debug=True, port=5002, host='0.0.0.0')
+    app.run(debug=DEBUG, port=PORT, host=HOST)

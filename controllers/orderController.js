@@ -2,75 +2,150 @@
 const db = require('../config/database');
 const NotificationModel = require('../models/notificationModel');
 
-// Helper function to send order status notifications to customers only
-async function sendOrderStatusNotification(userId, orderId, oldStatus, newStatus) {
+async function sendOrderStatusNotification(userId, orderId, oldStatus, newStatus, cancelReason = null) {
     try {
-        // Define status messages for customers
         const statusMessages = {
             'PENDING': 'Your order is pending confirmation',
             'CONFIRMED': 'Your order has been confirmed by the farmer',
             'IN_TRANSIT': 'Your order is on the way to you',
             'DELIVERED': 'Your order has been delivered',
-            'CANCELLED': 'Your order has been cancelled'
+            'CANCELLED': cancelReason ? `Your order has been cancelled. Reason: ${cancelReason}` : 'Your order has been cancelled'
         };
 
-        // Only send notification if status actually changed
         if (oldStatus !== newStatus) {
             const message = statusMessages[newStatus] || `Your order status has been updated to ${newStatus}`;
-            
-            // Create notification using your model
-            await NotificationModel.create(
-                userId,           // customer user_id
-                orderId,          // order_id
-                message           // message
-            );
-            
+            await NotificationModel.create(userId, orderId, message);
             console.log(`✅ Notification sent to customer ${userId} for order ${orderId}: ${message}`);
         }
     } catch (error) {
         console.error('❌ Error sending notification:', error);
-        // Don't throw error - notification failure shouldn't break the order update
     }
 }
 
 const orderController = {
-    // Get farmer's orders
+    async createOrder(req, res) {
+        const client = await db.pool.connect();
+        
+        try {
+            await client.query('BEGIN');
+            
+            const { items, delivery_option, address, contact_number, payment_method } = req.body;
+            const customer_id = req.user.user_id;
+            
+            if (!items || items.length === 0) {
+                throw new Error('No items in order');
+            }
+            
+            const firstProduct = await client.query(
+                'SELECT farmer_id FROM products WHERE product_id = $1',
+                [items[0].product_id]
+            );
+            
+            if (firstProduct.rows.length === 0) {
+                throw new Error('Product not found');
+            }
+            
+            const farmer_id = firstProduct.rows[0].farmer_id;
+            
+            let total_amount = 0;
+            for (const item of items) {
+                total_amount += item.price * item.quantity;
+            }
+            
+            const customerResult = await client.query(
+                'SELECT full_name FROM users WHERE user_id = $1',
+                [customer_id]
+            );
+            const customer_name = customerResult.rows[0]?.full_name || 'Customer';
+            
+            const orderResult = await client.query(`
+                INSERT INTO orders (
+                    customer_id, farmer_id, customer_name, total_amount, address, 
+                    contact_number, delivery_option, payment_method, 
+                    order_status, order_date
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', CURRENT_TIMESTAMP)
+                RETURNING order_id
+            `, [customer_id, farmer_id, customer_name, total_amount, address, contact_number, delivery_option, payment_method]);
+            
+            const order_id = orderResult.rows[0].order_id;
+            
+            for (const item of items) {
+                const productResult = await client.query(
+                    'SELECT product_name, image_url, stock FROM products WHERE product_id = $1',
+                    [item.product_id]
+                );
+                
+                if (productResult.rows.length === 0) {
+                    throw new Error(`Product ${item.product_id} not found`);
+                }
+                
+                const product_name = productResult.rows[0].product_name;
+                const product_image = productResult.rows[0].image_url || '';
+                const currentStock = productResult.rows[0].stock;
+                
+                if (currentStock < item.quantity) {
+                    throw new Error(`Insufficient stock for ${product_name}. Available: ${currentStock}`);
+                }
+                
+                await client.query(`
+                    INSERT INTO order_items (order_id, product_id, product_name_snapshot, product_image_snapshot, quantity, price)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                `, [order_id, item.product_id, product_name, product_image, item.quantity, item.price]);
+                
+                await client.query(`
+                    UPDATE products 
+                    SET stock = stock - $1,
+                        sold_count = sold_count + $1
+                    WHERE product_id = $2
+                `, [item.quantity, item.product_id]);
+            }
+            
+            await client.query('COMMIT');
+            
+            console.log(`✅ Order ${order_id} created with image snapshots`);
+            
+            res.json({
+                success: true,
+                message: 'Order created successfully',
+                order_id: order_id
+            });
+            
+        } catch (error) {
+            await client.query('ROLLBACK');
+            console.error('Create order error:', error);
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        } finally {
+            client.release();
+        }
+    },
+
     async getFarmerOrders(req, res) {
         try {
-            console.log('Getting farmer orders...');
-            console.log('User object:', req.user);
-            
             let farmerId = null;
             
             if (req.user.farmer_id) {
                 farmerId = req.user.farmer_id;
-            } else if (req.user.user && req.user.user.farmer_id) {
-                farmerId = req.user.user.farmer_id;
             } else if (req.user.user_id) {
-                console.log('No farmer_id in token, fetching from database for user_id:', req.user.user_id);
-                
                 const farmerResult = await db.query(
                     'SELECT farmer_id FROM farmers WHERE user_id = $1',
                     [req.user.user_id]
                 );
-                
                 if (farmerResult.rows.length > 0) {
                     farmerId = farmerResult.rows[0].farmer_id;
-                    console.log('Found farmer_id in database:', farmerId);
                 }
             }
             
             if (!farmerId) {
-                console.error('No farmer_id found for user');
                 return res.status(400).json({
                     success: false,
-                    error: 'Farmer ID not found. Please ensure you are registered as a farmer.'
+                    error: 'Farmer ID not found.'
                 });
             }
             
-            console.log('Using farmer_id:', farmerId);
-            
-            const query = `
+            const ordersQuery = `
                 SELECT 
                     o.order_id,
                     o.customer_name,
@@ -81,36 +156,61 @@ const orderController = {
                     o.contact_number,
                     o.delivery_option,
                     o.payment_method,
-                    COALESCE(
-                        json_agg(
-                            json_build_object(
-                                'product_id', oi.product_id,
-                                'product_name', p.product_name,
-                                'quantity', oi.quantity,
-                                'price', oi.price,
-                                'image_url', p.image_url,
-                                'unit', p.unit
-                            ) ORDER BY oi.order_item_id
-                        ) FILTER (WHERE oi.product_id IS NOT NULL), 
-                        '[]'::json
-                    ) as items
+                    o.cancel_reason
                 FROM orders o
-                LEFT JOIN order_items oi ON o.order_id = oi.order_id
-                LEFT JOIN products p ON oi.product_id = p.product_id
                 WHERE o.farmer_id = $1
-                GROUP BY o.order_id, o.customer_name, o.total_amount, o.order_status, o.order_date, 
-                         o.address, o.contact_number, o.delivery_option, o.payment_method
                 ORDER BY o.order_date DESC
             `;
             
-            const result = await db.query(query, [farmerId]);
+            const ordersResult = await db.query(ordersQuery, [farmerId]);
+            const ordersWithItems = [];
             
-            console.log(`Found ${result.rows.length} orders for farmer ${farmerId}`);
+            for (const order of ordersResult.rows) {
+                const itemsQuery = `
+                    SELECT 
+                        oi.order_item_id,
+                        oi.product_id,
+                        oi.product_name_snapshot,
+                        oi.product_image_snapshot,
+                        oi.quantity,
+                        oi.price,
+                        CASE WHEN p.product_id IS NULL THEN true ELSE false END as is_deleted
+                    FROM order_items oi
+                    LEFT JOIN products p ON oi.product_id = p.product_id
+                    WHERE oi.order_id = $1
+                    ORDER BY oi.order_item_id ASC
+                `;
+                
+                const itemsResult = await db.query(itemsQuery, [order.order_id]);
+                
+                const processedItems = itemsResult.rows.map(item => ({
+                    product_id: item.product_id,
+                    product_name: item.product_name_snapshot || `Product #${item.product_id}`,
+                    product_image: item.product_image_snapshot || '',
+                    quantity: parseInt(item.quantity) || 0,
+                    price: parseFloat(item.price) || 0,
+                    is_deleted: item.is_deleted === true
+                }));
+                
+                ordersWithItems.push({
+                    order_id: order.order_id,
+                    customer_name: order.customer_name,
+                    total_amount: parseFloat(order.total_amount) || 0,
+                    status: order.status,
+                    order_date: order.order_date,
+                    address: order.address,
+                    contact_number: order.contact_number,
+                    delivery_option: order.delivery_option,
+                    payment_method: order.payment_method,
+                    cancel_reason: order.cancel_reason,
+                    items: processedItems
+                });
+            }
             
             res.json({
                 success: true,
-                orders: result.rows,
-                count: result.rows.length
+                orders: ordersWithItems,
+                count: ordersWithItems.length
             });
             
         } catch (error) {
@@ -122,12 +222,11 @@ const orderController = {
         }
     },
 
-    // Get customer's orders
     async getCustomerOrders(req, res) {
         try {
             const userId = req.user.user_id;
             
-            const query = `
+            const ordersQuery = `
                 SELECT 
                     o.order_id,
                     o.customer_name,
@@ -138,34 +237,61 @@ const orderController = {
                     o.contact_number,
                     o.delivery_option,
                     o.payment_method,
-                    COALESCE(
-                        json_agg(
-                            json_build_object(
-                                'product_id', oi.product_id,
-                                'product_name', p.product_name,
-                                'quantity', oi.quantity,
-                                'price', oi.price,
-                                'image_url', p.image_url,
-                                'unit', p.unit
-                            ) ORDER BY oi.order_item_id
-                        ) FILTER (WHERE oi.product_id IS NOT NULL), 
-                        '[]'::json
-                    ) as items
+                    o.cancel_reason
                 FROM orders o
-                LEFT JOIN order_items oi ON o.order_id = oi.order_id
-                LEFT JOIN products p ON oi.product_id = p.product_id
                 WHERE o.customer_id = $1
-                GROUP BY o.order_id, o.customer_name, o.total_amount, o.order_status, o.order_date, 
-                         o.address, o.contact_number, o.delivery_option, o.payment_method
                 ORDER BY o.order_date DESC
             `;
             
-            const result = await db.query(query, [userId]);
+            const ordersResult = await db.query(ordersQuery, [userId]);
+            const ordersWithItems = [];
+            
+            for (const order of ordersResult.rows) {
+                const itemsQuery = `
+                    SELECT 
+                        oi.order_item_id,
+                        oi.product_id,
+                        oi.product_name_snapshot,
+                        oi.product_image_snapshot,
+                        oi.quantity,
+                        oi.price,
+                        CASE WHEN p.product_id IS NULL THEN true ELSE false END as is_deleted
+                    FROM order_items oi
+                    LEFT JOIN products p ON oi.product_id = p.product_id
+                    WHERE oi.order_id = $1
+                    ORDER BY oi.order_item_id ASC
+                `;
+                
+                const itemsResult = await db.query(itemsQuery, [order.order_id]);
+                
+                const processedItems = itemsResult.rows.map(item => ({
+                    product_id: item.product_id,
+                    product_name: item.product_name_snapshot || `Product #${item.product_id}`,
+                    product_image: item.product_image_snapshot || '',
+                    quantity: parseInt(item.quantity) || 0,
+                    price: parseFloat(item.price) || 0,
+                    is_deleted: item.is_deleted === true
+                }));
+                
+                ordersWithItems.push({
+                    order_id: order.order_id,
+                    customer_name: order.customer_name,
+                    total_amount: parseFloat(order.total_amount) || 0,
+                    status: order.status,
+                    order_date: order.order_date,
+                    address: order.address,
+                    contact_number: order.contact_number,
+                    delivery_option: order.delivery_option,
+                    payment_method: order.payment_method,
+                    cancel_reason: order.cancel_reason,
+                    items: processedItems
+                });
+            }
             
             res.json({
                 success: true,
-                orders: result.rows,
-                count: result.rows.length
+                orders: ordersWithItems,
+                count: ordersWithItems.length
             });
             
         } catch (error) {
@@ -177,14 +303,13 @@ const orderController = {
         }
     },
 
-    // Get order by ID
     async getOrderById(req, res) {
         try {
             const { id } = req.params;
             const userId = req.user.user_id;
             const userRole = req.user.role;
             
-            let query = `
+            let orderQuery = `
                 SELECT 
                     o.order_id,
                     o.customer_id,
@@ -197,29 +322,13 @@ const orderController = {
                     o.contact_number,
                     o.delivery_option,
                     o.payment_method,
-                    COALESCE(
-                        json_agg(
-                            json_build_object(
-                                'product_id', oi.product_id,
-                                'product_name', p.product_name,
-                                'quantity', oi.quantity,
-                                'price', oi.price,
-                                'image_url', p.image_url,
-                                'unit', p.unit
-                            ) ORDER BY oi.order_item_id
-                        ) FILTER (WHERE oi.product_id IS NOT NULL), 
-                        '[]'::json
-                    ) as items
+                    o.cancel_reason
                 FROM orders o
-                LEFT JOIN order_items oi ON o.order_id = oi.order_id
-                LEFT JOIN products p ON oi.product_id = p.product_id
                 WHERE o.order_id = $1
             `;
             
-            const values = [id];
-            let paramIndex = 2;
+            const orderValues = [id];
             
-            // Add role-based filtering
             if (userRole === 'FARMER') {
                 let farmerId = null;
                 if (req.user.farmer_id) {
@@ -235,32 +344,69 @@ const orderController = {
                 }
                 
                 if (farmerId) {
-                    query += ` AND o.farmer_id = $${paramIndex}`;
-                    values.push(farmerId);
-                    paramIndex++;
+                    orderQuery += ` AND o.farmer_id = $2`;
+                    orderValues.push(farmerId);
                 }
             } else {
-                query += ` AND o.customer_id = $${paramIndex}`;
-                values.push(userId);
-                paramIndex++;
+                orderQuery += ` AND o.customer_id = $2`;
+                orderValues.push(userId);
             }
             
-            query += ` GROUP BY o.order_id, o.customer_id, o.farmer_id, o.customer_name, o.total_amount, 
-                              o.order_status, o.order_date, o.address, o.contact_number, 
-                              o.delivery_option, o.payment_method`;
+            const orderResult = await db.query(orderQuery, orderValues);
             
-            const result = await db.query(query, values);
-            
-            if (result.rows.length === 0) {
+            if (orderResult.rows.length === 0) {
                 return res.status(404).json({
                     success: false,
                     error: 'Order not found'
                 });
             }
             
+            const order = orderResult.rows[0];
+            console.log(`📋 Order ${id} - cancel_reason from DB: "${order.cancel_reason}"`);
+            
+            const itemsQuery = `
+                SELECT 
+                    oi.order_item_id,
+                    oi.product_id,
+                    oi.product_name_snapshot,
+                    oi.product_image_snapshot,
+                    oi.quantity,
+                    oi.price,
+                    CASE WHEN p.product_id IS NULL THEN true ELSE false END as is_deleted
+                FROM order_items oi
+                LEFT JOIN products p ON oi.product_id = p.product_id
+                WHERE oi.order_id = $1
+                ORDER BY oi.order_item_id ASC
+            `;
+            
+            const itemsResult = await db.query(itemsQuery, [id]);
+            
+            const processedItems = itemsResult.rows.map(item => ({
+                product_id: item.product_id,
+                product_name: item.product_name_snapshot || `Product #${item.product_id}`,
+                product_image: item.product_image_snapshot || '',
+                quantity: parseInt(item.quantity) || 0,
+                price: parseFloat(item.price) || 0,
+                is_deleted: item.is_deleted === true
+            }));
+            
             res.json({
                 success: true,
-                order: result.rows[0]
+                order: {
+                    order_id: order.order_id,
+                    customer_id: order.customer_id,
+                    farmer_id: order.farmer_id,
+                    customer_name: order.customer_name,
+                    total_amount: parseFloat(order.total_amount) || 0,
+                    order_status: order.order_status,
+                    order_date: order.order_date,
+                    address: order.address,
+                    contact_number: order.contact_number,
+                    delivery_option: order.delivery_option,
+                    payment_method: order.payment_method,
+                    cancel_reason: order.cancel_reason,
+                    items: processedItems
+                }
             });
             
         } catch (error) {
@@ -272,7 +418,6 @@ const orderController = {
         }
     },
 
-    // Update order status (for farmers) - UPDATED WITH NOTIFICATIONS
     async updateOrderStatus(req, res) {
         const client = await db.pool.connect();
         
@@ -292,7 +437,6 @@ const orderController = {
                 });
             }
             
-            // Get order details with customer_id and current status
             const orderQuery = await client.query(
                 'SELECT order_status, farmer_id, customer_id FROM orders WHERE order_id = $1',
                 [id]
@@ -306,7 +450,6 @@ const orderController = {
             const currentStatus = order.order_status;
             const customerId = order.customer_id;
             
-            // Check authorization for farmers
             if (userRole === 'FARMER') {
                 let farmerId = null;
                 if (req.user.farmer_id) {
@@ -326,47 +469,6 @@ const orderController = {
                 }
             }
             
-            // If cancelling an order that wasn't cancelled before, RESTORE STOCK
-            if (status === 'CANCELLED' && currentStatus !== 'CANCELLED') {
-                const itemsQuery = await client.query(
-                    `SELECT oi.product_id, oi.quantity, p.product_name 
-                     FROM order_items oi
-                     JOIN products p ON oi.product_id = p.product_id
-                     WHERE oi.order_id = $1`,
-                    [id]
-                );
-                
-                for (const item of itemsQuery.rows) {
-                    // Restore stock
-                    await client.query(
-                        `UPDATE products 
-                         SET stock = stock + $1,
-                             sold_count = sold_count - $1
-                         WHERE product_id = $2`,
-                        [item.quantity, item.product_id]
-                    );
-                    
-                    // Check if product should be AVAILABLE again
-                    const stockCheck = await client.query(
-                        'SELECT stock FROM products WHERE product_id = $1',
-                        [item.product_id]
-                    );
-                    
-                    const newStock = stockCheck.rows[0].stock;
-                    
-                    if (newStock > 0) {
-                        await client.query(
-                            `UPDATE products 
-                             SET status = 'AVAILABLE'
-                             WHERE product_id = $1 AND status = 'UNAVAILABLE'`,
-                            [item.product_id]
-                        );
-                        console.log(`✅ Product ${item.product_id} (${item.product_name}) is now back in stock - status set to AVAILABLE`);
-                    }
-                }
-            }
-            
-            // Update order status
             await client.query(
                 `UPDATE orders 
                  SET order_status = $1
@@ -375,8 +477,6 @@ const orderController = {
             );
             
             await client.query('COMMIT');
-            
-            // Send notification to customer about status change
             await sendOrderStatusNotification(customerId, id, currentStatus, status);
             
             res.json({
@@ -396,7 +496,6 @@ const orderController = {
         }
     },
 
-    // Cancel order (for customers) - UPDATED WITH NOTIFICATIONS
     async cancelOrder(req, res) {
         const client = await db.pool.connect();
         
@@ -404,14 +503,13 @@ const orderController = {
             await client.query('BEGIN');
             
             const { id } = req.params;
-            const { reason } = req.body; // Optional cancellation reason
+            const { reason } = req.body;
             const userId = req.user.user_id;
             
-            console.log(`Customer ${userId} attempting to cancel order ${id}`);
+            console.log(`📝 Cancelling order ${id} with reason: "${reason}"`);
             
-            // Get order details
             const orderQuery = await client.query(
-                'SELECT order_status, customer_id, farmer_id, total_amount FROM orders WHERE order_id = $1',
+                'SELECT order_status, customer_id, farmer_id FROM orders WHERE order_id = $1',
                 [id]
             );
             
@@ -422,28 +520,22 @@ const orderController = {
             const order = orderQuery.rows[0];
             const currentStatus = order.order_status;
             
-            // Check if order belongs to this customer
             if (order.customer_id !== userId) {
                 throw new Error('Not authorized to cancel this order');
             }
             
-            // UPDATED: Only allow cancellation if order status is PENDING
             if (order.order_status !== 'PENDING') {
                 throw new Error(`Cannot cancel order with status: ${order.order_status}. Only PENDING orders can be cancelled.`);
             }
             
-            // Get order items to restore stock
             const itemsQuery = await client.query(
-                `SELECT oi.product_id, oi.quantity, p.product_name 
+                `SELECT oi.product_id, oi.quantity 
                  FROM order_items oi
-                 JOIN products p ON oi.product_id = p.product_id
                  WHERE oi.order_id = $1`,
                 [id]
             );
             
-            // Restore stock for each item
             for (const item of itemsQuery.rows) {
-                // Restore stock
                 await client.query(
                     `UPDATE products 
                      SET stock = stock + $1,
@@ -452,48 +544,43 @@ const orderController = {
                     [item.quantity, item.product_id]
                 );
                 
-                // Check if product should be AVAILABLE again
                 const stockCheck = await client.query(
                     'SELECT stock FROM products WHERE product_id = $1',
                     [item.product_id]
                 );
                 
-                const newStock = stockCheck.rows[0].stock;
-                
-                if (newStock > 0) {
+                if (stockCheck.rows[0].stock > 0) {
                     await client.query(
                         `UPDATE products 
                          SET status = 'AVAILABLE'
                          WHERE product_id = $1 AND status = 'UNAVAILABLE'`,
                         [item.product_id]
                     );
-                    console.log(`✅ Product ${item.product_id} (${item.product_name}) is now back in stock - status set to AVAILABLE`);
                 }
             }
             
-            // Update order status to CANCELLED
-            await client.query(
+            const cancelReason = reason && reason.trim() !== '' ? reason.trim() : 'Cancelled by customer';
+            
+            const updateResult = await client.query(
                 `UPDATE orders 
-                 SET order_status = 'CANCELLED'
-                 WHERE order_id = $1`,
-                [id]
+                 SET order_status = 'CANCELLED',
+                     cancel_reason = $1
+                 WHERE order_id = $2
+                 RETURNING order_id, order_status, cancel_reason`,
+                [cancelReason, id]
             );
             
+            console.log(`✅ Cancel result:`, updateResult.rows[0]);
+            
             await client.query('COMMIT');
-            
-            // Send notification about cancellation (to the same user)
-            await sendOrderStatusNotification(userId, id, currentStatus, 'CANCELLED');
-            
-            console.log(`✅ Order ${id} cancelled successfully by customer ${userId}`);
-            if (reason) {
-                console.log(`   Cancellation reason: ${reason}`);
-            }
+            await sendOrderStatusNotification(userId, id, currentStatus, 'CANCELLED', cancelReason);
             
             res.json({
                 success: true,
                 message: 'Order cancelled successfully',
                 order_id: parseInt(id),
-                status: 'CANCELLED'
+                status: 'CANCELLED',
+                cancel_reason: cancelReason
             });
             
         } catch (error) {
@@ -508,7 +595,95 @@ const orderController = {
         }
     },
 
-    // Get order statistics for dashboard
+    async bulkUpdateOrderStatus(req, res) {
+        const client = await db.pool.connect();
+        
+        try {
+            await client.query('BEGIN');
+            
+            const { orderIds, status } = req.body;
+            const userId = req.user.user_id;
+            
+            if (!orderIds || !orderIds.length || !status) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Order IDs and status are required'
+                });
+            }
+            
+            const validStatuses = ['PENDING', 'CONFIRMED', 'IN_TRANSIT', 'DELIVERED', 'CANCELLED'];
+            if (!validStatuses.includes(status)) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Invalid status'
+                });
+            }
+            
+            let farmerId = null;
+            if (req.user.farmer_id) {
+                farmerId = req.user.farmer_id;
+            } else {
+                const farmerResult = await client.query(
+                    'SELECT farmer_id FROM farmers WHERE user_id = $1',
+                    [userId]
+                );
+                if (farmerResult.rows.length > 0) {
+                    farmerId = farmerResult.rows[0].farmer_id;
+                }
+            }
+            
+            if (!farmerId) {
+                throw new Error('Farmer ID not found');
+            }
+            
+            const getOrdersQuery = `
+                SELECT order_id, order_status, customer_id
+                FROM orders
+                WHERE order_id = ANY($1::int[]) AND farmer_id = $2
+            `;
+            
+            const ordersResult = await client.query(getOrdersQuery, [orderIds, farmerId]);
+            const orders = ordersResult.rows;
+            
+            if (orders.length === 0) {
+                throw new Error('No valid orders found');
+            }
+            
+            const updateQuery = `
+                UPDATE orders 
+                SET order_status = $1
+                WHERE order_id = ANY($2::int[])
+                RETURNING order_id, customer_id
+            `;
+            
+            const result = await client.query(updateQuery, [status, orderIds]);
+            
+            await client.query('COMMIT');
+            
+            for (const order of orders) {
+                if (order.order_status !== status) {
+                    await sendOrderStatusNotification(order.customer_id, order.order_id, order.order_status, status);
+                }
+            }
+            
+            res.json({
+                success: true,
+                message: `${result.rowCount} orders updated successfully`,
+                orders: result.rows
+            });
+            
+        } catch (error) {
+            await client.query('ROLLBACK');
+            console.error('Bulk update order status error:', error);
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        } finally {
+            client.release();
+        }
+    },
+    
     async getOrderStats(req, res) {
         try {
             const userId = req.user.user_id;
@@ -518,7 +693,6 @@ const orderController = {
             let values = [];
             
             if (userRole === 'FARMER') {
-                // Get farmer_id
                 let farmerId = null;
                 if (req.user.farmer_id) {
                     farmerId = req.user.farmer_id;
@@ -582,100 +756,6 @@ const orderController = {
                 success: false,
                 error: error.message
             });
-        }
-    },
-
-    // Optional: Bulk update order status (for farmers)
-    async bulkUpdateOrderStatus(req, res) {
-        const client = await db.pool.connect();
-        
-        try {
-            await client.query('BEGIN');
-            
-            const { orderIds, status } = req.body;
-            const userId = req.user.user_id;
-            
-            if (!orderIds || !orderIds.length || !status) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Order IDs and status are required'
-                });
-            }
-            
-            const validStatuses = ['PENDING', 'CONFIRMED', 'IN_TRANSIT', 'DELIVERED', 'CANCELLED'];
-            if (!validStatuses.includes(status)) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Invalid status'
-                });
-            }
-            
-            // Get farmer_id
-            let farmerId = null;
-            if (req.user.farmer_id) {
-                farmerId = req.user.farmer_id;
-            } else {
-                const farmerResult = await client.query(
-                    'SELECT farmer_id FROM farmers WHERE user_id = $1',
-                    [userId]
-                );
-                if (farmerResult.rows.length > 0) {
-                    farmerId = farmerResult.rows[0].farmer_id;
-                }
-            }
-            
-            if (!farmerId) {
-                throw new Error('Farmer ID not found');
-            }
-            
-            // Get all orders with their current status and customer_ids
-            const getOrdersQuery = `
-                SELECT order_id, order_status, customer_id
-                FROM orders
-                WHERE order_id = ANY($1::int[]) AND farmer_id = $2
-            `;
-            
-            const ordersResult = await client.query(getOrdersQuery, [orderIds, farmerId]);
-            const orders = ordersResult.rows;
-            
-            if (orders.length === 0) {
-                throw new Error('No valid orders found');
-            }
-            
-            // Update all orders
-            const updateQuery = `
-                UPDATE orders 
-                SET order_status = $1
-                WHERE order_id = ANY($2::int[])
-                RETURNING order_id, customer_id
-            `;
-            
-            const result = await client.query(updateQuery, [status, orderIds]);
-            
-            await client.query('COMMIT');
-            
-            // Send notifications for each updated order
-            for (const order of orders) {
-                if (order.order_status !== status) { // Only if status changed
-                    await sendOrderStatusNotification(order.customer_id, order.order_id, order.order_status, status);
-                }
-            }
-            
-            res.json({
-                success: true,
-                message: `${result.rowCount} orders updated successfully`,
-                orders: result.rows
-            });
-            
-        } catch (error) {
-            await client.query('ROLLBACK');
-            console.error('Bulk update order status error:', error);
-            res.status(500).json({
-                success: false,
-                error: error.message
-            });
-        } finally {
-            client.release();
         }
     }
 };
