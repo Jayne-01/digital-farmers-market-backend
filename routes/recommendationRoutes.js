@@ -4,6 +4,23 @@ const router = express.Router();
 const { authenticateToken, authorizeRole } = require('../middleware/authMiddleware');
 const pool = require('../config/database');
 const randomForest = require('../services/ml/randomForestPredictor');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const csv = require('csv-parser');
+
+// Configure multer for CSV uploads
+const upload = multer({
+    dest: 'data/',
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'text/csv' || path.extname(file.originalname) === '.csv') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only CSV files are allowed'));
+        }
+    }
+});
 
 // ====================== HELPER FUNCTIONS ======================
 function getCurrentSeason() {
@@ -298,7 +315,6 @@ router.get('/personalized-insights', authenticateToken, authorizeRole('FARMER'),
             
             // Check if farmer already grows this product
             let farmerGrows = farmerProductNames.includes(marketNormalized);
-            let matchedProduct = farmerProducts.rows.find(p => p.normalized_name === marketNormalized);
             
             // Calculate ML demand score
             let mlScore = market.base_demand_score;
@@ -372,7 +388,7 @@ router.get('/personalized-insights', authenticateToken, authorizeRole('FARMER'),
     }
 });
 
-// ===================== NEW: PRICE DROP RECOMMENDATIONS =====================
+// ===================== PRICE DROP RECOMMENDATIONS =====================
 async function getPriceDropRecommendations(farmerId, farmerProducts) {
     try {
         const priceRecommendations = [];
@@ -431,8 +447,6 @@ async function getPriceDropRecommendations(farmerId, farmerProducts) {
                     
                     // Round to 2 decimal places
                     suggestedPrice = Math.round(suggestedPrice * 100) / 100;
-                    const newPriceDifference = currentPrice - suggestedPrice;
-                    const potentialSalesLoss = Math.round(competitorQuery.rows.reduce((sum, c) => sum + parseInt(c.total_sold), 0) * (priceDifferencePercent / 100));
                     
                     priceRecommendations.push({
                         product_id: product.product_id,
@@ -454,10 +468,7 @@ async function getPriceDropRecommendations(farmerId, farmerProducts) {
                             ? `🔥 Reduce price from ₱${currentPrice} to ₱${suggestedPrice} to stay competitive!` 
                             : suggestionType === '📉 Overpriced'
                             ? `📉 Consider lowering from ₱${currentPrice} to ₱${suggestedPrice}`
-                            : `💡 Small adjustment from ₱${currentPrice} to ₱${suggestedPrice} recommended`,
-                        estimated_sales_impact: potentialSalesLoss > 0 
-                            ? `You may be losing approximately ${potentialSalesLoss} sales to competitors`
-                            : 'Price gap is small, but adjustment could help'
+                            : `💡 Small adjustment from ₱${currentPrice} to ₱${suggestedPrice} recommended`
                     });
                 }
             }
@@ -480,7 +491,7 @@ async function getPriceDropRecommendations(farmerId, farmerProducts) {
     }
 }
 
-// ===================== NEW: SINGLE PRODUCT PRICE CHECK =====================
+// ===================== SINGLE PRODUCT PRICE CHECK =====================
 router.get('/check-price/:productId', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
     try {
         const { productId } = req.params;
@@ -529,7 +540,7 @@ router.get('/check-price/:productId', authenticateToken, authorizeRole('FARMER')
     }
 });
 
-// ===================== NEW: BULK PRICE UPDATE SUGGESTION =====================
+// ===================== BULK PRICE UPDATE SUGGESTION =====================
 router.post('/apply-price-suggestion', authenticateToken, authorizeRole('FARMER'), async (req, res) => {
     const { productId, suggestedPrice } = req.body;
     const userId = req.user.user_id || req.user.id;
@@ -641,5 +652,178 @@ router.get('/data-status', authenticateToken, authorizeRole('ADMIN'), async (req
         res.status(500).json({ success: false, error: error.message });
     }
 });
+
+// ===================== WEEKLY DATA UPLOAD & RETRAIN =====================
+router.post('/admin/upload-weekly-data',
+    authenticateToken,
+    authorizeRole('ADMIN'),
+    upload.single('csvFile'),
+    async (req, res) => {
+        try {
+            if (!req.file) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'No file uploaded'
+                });
+            }
+
+            const results = [];
+
+            // Parse CSV file
+            await new Promise((resolve, reject) => {
+                fs.createReadStream(req.file.path)
+                    .pipe(csv())
+                    .on('data', (data) => {
+                        // Convert date format if needed (DD/MM/YYYY to YYYY-MM-DD)
+                        if (data.sale_date && data.sale_date.includes('/')) {
+                            const parts = data.sale_date.split('/');
+                            data.sale_date = `${parts[2]}-${parts[1]}-${parts[0]}`;
+                        }
+                        results.push(data);
+                    })
+                    .on('end', resolve)
+                    .on('error', reject);
+            });
+
+            // Delete temp file
+            fs.unlinkSync(req.file.path);
+
+            if (results.length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'CSV file is empty or has no valid data'
+                });
+            }
+
+            // Insert into historical_sales
+            let inserted = 0;
+            let skipped = 0;
+
+            for (const record of results) {
+                // Skip if required fields are missing
+                if (!record.product_name || !record.sale_date) {
+                    skipped++;
+                    continue;
+                }
+
+                // Check if record already exists
+                const check = await pool.query(
+                    `SELECT id FROM historical_sales 
+                     WHERE product_name = $1 AND sale_date = $2 AND market_location = $3`,
+                    [record.product_name, record.sale_date, record.market_location || 'Bulan Public Market']
+                );
+
+                if (check.rows.length === 0) {
+                    await pool.query(`
+                        INSERT INTO historical_sales 
+                        (product_name, category, price, quantity_sold, sale_date, season, market_location)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    `, [
+                        record.product_name,
+                        record.category || 'Uncategorized',
+                        parseFloat(record.price) || 0,
+                        parseInt(record.quantity_sold) || 0,
+                        record.sale_date,
+                        record.season || 'Dry',
+                        record.market_location || 'Bulan Public Market'
+                    ]);
+                    inserted++;
+                } else {
+                    skipped++;
+                }
+            }
+
+            // Update market_product_demand totals
+            await pool.query(`
+                UPDATE market_product_demand mpd
+                SET total_sales = (
+                    SELECT COALESCE(SUM(quantity_sold), 0)
+                    FROM historical_sales hs
+                    WHERE LOWER(TRIM(hs.product_name)) = LOWER(TRIM(mpd.product_name))
+                ),
+                last_updated = NOW()
+            `);
+
+            // Update price ranges based on latest data
+            for (const record of results) {
+                if (record.product_name && record.price) {
+                    await pool.query(`
+                        UPDATE market_product_demand
+                        SET price_range_min = LEAST(price_range_min, $1),
+                            price_range_max = GREATEST(price_range_max, $1)
+                        WHERE LOWER(TRIM(product_name)) = LOWER(TRIM($2))
+                    `, [parseFloat(record.price), record.product_name]);
+                }
+            }
+
+            // Retrain ML model
+            console.log('🔄 Retraining Random Forest model with new data...');
+            const retrainSuccess = await randomForest.trainModel();
+
+            res.json({
+                success: true,
+                message: 'Weekly data uploaded and model retrained successfully!',
+                records_processed: results.length,
+                new_records_added: inserted,
+                records_skipped: skipped,
+                model_trained: randomForest.isTrained,
+                retrain_success: retrainSuccess
+            });
+
+        } catch (error) {
+            console.error('Weekly upload error:', error);
+            // Clean up temp file if exists
+            if (req.file && fs.existsSync(req.file.path)) {
+                fs.unlinkSync(req.file.path);
+            }
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        }
+    }
+);
+
+// GET /recommendations/admin/last-upload - Get last upload info
+router.get('/admin/last-upload',
+    authenticateToken,
+    authorizeRole('ADMIN'),
+    async (req, res) => {
+        try {
+            const result = await pool.query(`
+                SELECT 
+                    MAX(sale_date) as last_upload_date,
+                    COUNT(*) as total_records,
+                    COUNT(DISTINCT product_name) as unique_products
+                FROM historical_sales
+                WHERE sale_date >= NOW() - INTERVAL '30 days'
+            `);
+
+            const lastWeekData = await pool.query(`
+                SELECT 
+                    sale_date,
+                    COUNT(*) as records_count
+                FROM historical_sales
+                WHERE sale_date >= NOW() - INTERVAL '7 days'
+                GROUP BY sale_date
+                ORDER BY sale_date DESC
+                LIMIT 1
+            `);
+
+            res.json({
+                success: true,
+                summary: {
+                    last_upload_date: result.rows[0].last_upload_date,
+                    total_records_last_30_days: parseInt(result.rows[0].total_records) || 0,
+                    unique_products_last_30_days: parseInt(result.rows[0].unique_products) || 0
+                },
+                last_week: lastWeekData.rows[0] || null
+            });
+        } catch (error) {
+            console.error('Last upload error:', error);
+            res.status(500).json({ success: false, error: error.message });
+        }
+    }
+);
 
 module.exports = router;
