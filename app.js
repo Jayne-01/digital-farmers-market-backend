@@ -62,6 +62,88 @@ pool.on('error', (err) => {
     process.exit(-1);
 });
 
+// ========== HELPER FUNCTION TO CHECK MAINTENANCE MODE ==========
+async function isMaintenanceMode() {
+    try {
+        const tableCheck = await pool.query(`
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'system_settings'
+            );
+        `);
+        
+        if (!tableCheck.rows[0].exists) {
+            return false;
+        }
+        
+        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
+        return result.rows[0]?.maintenance_mode === true;
+    } catch (error) {
+        console.error('Maintenance check error:', error);
+        return false;
+    }
+}
+
+// ========== MAINTENANCE STATUS ENDPOINT (PUBLIC) ==========
+app.get('/api/maintenance-status', async (req, res) => {
+    try {
+        const maintenance_mode = await isMaintenanceMode();
+        console.log(`🔧 Maintenance mode is: ${maintenance_mode ? 'ON' : 'OFF'}`);
+        res.json({ maintenance_mode });
+    } catch (error) {
+        console.error('❌ Maintenance status error:', error);
+        res.json({ maintenance_mode: false });
+    }
+});
+
+// ========== MAINTENANCE MODE MIDDLEWARE - ALLOWS ADMIN ==========
+async function maintenanceMiddleware(req, res, next) {
+    // Skip for maintenance status endpoint
+    if (req.path === '/api/maintenance-status') {
+        return next();
+    }
+    
+    // Skip for admin API routes (so admin can login and turn off maintenance)
+    if (req.path.startsWith('/api/admin')) {
+        return next();
+    }
+    
+    // Skip for admin auth endpoints
+    if (req.path === '/api/auth/admin/login') {
+        return next();
+    }
+    
+    // Skip for static files
+    if (req.path.match(/\.(css|js|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf)$/)) {
+        return next();
+    }
+    
+    try {
+        const maintenanceMode = await isMaintenanceMode();
+        
+        if (maintenanceMode) {
+            // Check if this is an API request (starts with /api/)
+            if (req.path.startsWith('/api/')) {
+                // For API requests, return JSON 503
+                return res.status(503).json({
+                    success: false,
+                    maintenance: true,
+                    error: 'System is under maintenance. Please try again later.',
+                    redirect: '/maintenance.html'
+                });
+            }
+            
+            // For HTML page requests, redirect to maintenance page
+            return res.redirect('/maintenance.html');
+        }
+        
+        next();
+    } catch (error) {
+        console.error('Maintenance middleware error:', error);
+        next();
+    }
+}
+
 // ========== GOOGLE OAUTH SETUP ==========
 passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID,
@@ -105,7 +187,7 @@ passport.use(new GoogleStrategy({
           [
             profile.displayName,
             profile.emails[0].value,
-            'CUSTOMER',  // Default role (they can register as farmer later)
+            'CUSTOMER',
             null,
             null,
             null,
@@ -130,7 +212,7 @@ passport.use(new GoogleStrategy({
         }
       }
 
-      // Generate JWT token (same as your login)
+      // Generate JWT token
       const token = jwt.sign(
         { 
           user_id: user.user_id, 
@@ -154,103 +236,6 @@ passport.use(new GoogleStrategy({
 
 passport.serializeUser((userData, done) => done(null, userData));
 passport.deserializeUser((obj, done) => done(null, obj));
-
-// ========== MAINTENANCE STATUS ENDPOINT (PUBLIC) - MUST BE BEFORE MIDDLEWARE ==========
-// GET /api/maintenance-status - Public endpoint for frontend to check maintenance mode
-app.get('/api/maintenance-status', async (req, res) => {
-    try {
-        console.log('🔧 Maintenance status check...');
-        
-        // Check if system_settings table exists
-        const tableCheck = await pool.query(`
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'system_settings'
-            );
-        `);
-        
-        if (!tableCheck.rows[0].exists) {
-            console.log('📋 system_settings table not found, maintenance_mode = false');
-            return res.json({ maintenance_mode: false });
-        }
-        
-        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
-        const maintenance_mode = result.rows[0]?.maintenance_mode === true;
-        
-        console.log(`🔧 Maintenance mode is: ${maintenance_mode ? 'ON' : 'OFF'}`);
-        res.json({ maintenance_mode });
-        
-    } catch (error) {
-        console.error('❌ Maintenance status error:', error);
-        res.json({ maintenance_mode: false });
-    }
-});
-
-// ========== MAINTENANCE MODE MIDDLEWARE ==========
-// This middleware blocks non-admin users when maintenance mode is ON
-async function maintenanceMiddleware(req, res, next) {
-    // Skip for admin routes (both API and HTML pages), auth routes, maintenance status, static files
-    const skipPaths = [
-        '/api/admin',
-        '/api/maintenance-status',
-        '/api/auth/admin/login',  // Add this line - allows admin login API
-        '/api/auth/login',  
-        '/admin',
-        '/maintenance.html',
-        '/auth/login.html',
-        '/auth/register.html'
-    ];
-    
-    const shouldSkip = skipPaths.some(path => req.path.startsWith(path)) ||
-                       req.path.endsWith('.css') ||
-                       req.path.endsWith('.js') ||
-                       req.path.endsWith('.png') ||
-                       req.path.endsWith('.jpg') ||
-                       req.path.endsWith('.svg') ||
-                       req.path.endsWith('.ico') ||
-                       req.path.endsWith('.woff') ||
-                       req.path.endsWith('.woff2') ||
-                       req.path.endsWith('.ttf');
-    
-    if (shouldSkip) {
-        return next();
-    }
-    
-    try {
-        // Check if system_settings table exists
-        const tableCheck = await pool.query(`
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'system_settings'
-            );
-        `);
-        
-        if (!tableCheck.rows[0].exists) {
-            return next();
-        }
-        
-        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
-        const isMaintenanceMode = result.rows[0]?.maintenance_mode === true;
-        
-        if (isMaintenanceMode) {
-            // Check if request expects JSON
-            if (req.headers.accept && req.headers.accept.includes('application/json')) {
-                return res.status(503).json({ 
-                    success: false, 
-                    error: 'Site is under maintenance. Please try again later.',
-                    maintenance: true
-                });
-            }
-            // For all other HTML requests, redirect to maintenance page
-            return res.redirect('/maintenance.html');
-        }
-        
-        next();
-    } catch (error) {
-        console.error('Maintenance middleware error:', error);
-        next();
-    }
-}
 
 // ========== MIDDLEWARE ==========
 app.use(helmet({
@@ -354,6 +339,18 @@ const authenticateToken = async (req, res, next) => {
             id: decoded.user_id
         };
         
+        // ===== MAINTENANCE MODE CHECK IN AUTH - ALLOWS ADMIN =====
+        const maintenanceMode = await isMaintenanceMode();
+        if (maintenanceMode && req.user.role !== 'ADMIN') {
+            return res.status(503).json({ 
+                success: false, 
+                maintenance: true,
+                error: 'System is under maintenance. Please try again later.',
+                redirect: '/maintenance.html'
+            });
+        }
+        // ===== END MAINTENANCE MODE CHECK =====
+        
         next();
     } catch (error) {
         if (error.name === 'JsonWebTokenError') {
@@ -410,6 +407,16 @@ const authorizeRole = (roles) => {
  * @access  Public
  */
 app.post('/api/auth/register', async (req, res) => {
+    // Check maintenance mode first
+    const maintenanceMode = await isMaintenanceMode();
+    if (maintenanceMode) {
+        return res.status(503).json({
+            success: false,
+            maintenance: true,
+            error: 'System is under maintenance. Registration is disabled.'
+        });
+    }
+    
     console.log('📝 Register endpoint called');
     
     try {
@@ -590,6 +597,16 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(403).json({ 
                 success: false,
                 error: 'Account is deactivated. Please contact support.' 
+            });
+        }
+        
+        // Check maintenance mode - block non-admin logins
+        const maintenanceMode = await isMaintenanceMode();
+        if (maintenanceMode && user.role !== 'ADMIN') {
+            return res.status(503).json({
+                success: false,
+                maintenance: true,
+                error: 'System is under maintenance. Only administrators can login at this time.'
             });
         }
         
@@ -1005,12 +1022,9 @@ app.post('/api/auth/register-farmer', authenticateToken, async (req, res) => {
                     farm_name,
                     farm_location || null,
                     farm_description || null,
-                    false  // Not verified until admin approves
+                    false
                 ]
             );
-
-            // IMPORTANT: User role remains as CUSTOMER until admin approves
-            // No role change here
 
             await client.query('COMMIT');
 
@@ -1296,8 +1310,6 @@ app.delete('/api/auth/admin/reject-farmer/:farmerId', authenticateToken, authori
             [farmerId]
         );
 
-        // User role remains as CUSTOMER (no change needed)
-
         await client.query('COMMIT');
 
         console.log('❌ Farmer application rejected and removed');
@@ -1438,10 +1450,17 @@ app.get('/api/auth/farmer/profile', authenticateToken, authorizeRole(['FARMER'])
 });
 
 // ========== ADMIN ENDPOINTS ==========
+
+/**
+ * @route   POST /api/auth/create-first-admin
+ * @desc    Create the first admin user
+ * @access  Public (only works if no admin exists)
+ */
 app.post('/api/auth/create-first-admin', async (req, res) => {
     console.log('👑 Create first admin endpoint called');
     
     try {
+        // Check if any admin already exists
         const adminCheck = await pool.query(
             'SELECT * FROM users WHERE role = $1',
             ['ADMIN']
@@ -1525,8 +1544,7 @@ app.post('/api/auth/create-first-admin', async (req, res) => {
             success: true,
             message: 'First admin created successfully',
             token,
-            admin: adminUser,
-            warning: 'Save this token securely. Use it to register additional admins.'
+            admin: adminUser
         });
         
     } catch (error) {
@@ -1539,6 +1557,11 @@ app.post('/api/auth/create-first-admin', async (req, res) => {
     }
 });
 
+/**
+ * @route   POST /api/auth/admin/register
+ * @desc    Register a new admin (requires existing admin)
+ * @access  Private (Admin only)
+ */
 app.post('/api/auth/admin/register', authenticateToken, async (req, res) => {
     console.log('👥 Admin registration endpoint called by:', req.user.email);
     
@@ -1675,25 +1698,38 @@ app.post('/api/auth/admin/register', authenticateToken, async (req, res) => {
     }
 });
 
+/**
+ * @route   POST /api/auth/admin/login
+ * @desc    Admin login
+ * @access  Public
+ */
 app.post('/api/auth/admin/login', async (req, res) => {
     console.log('👑 Admin login endpoint called');
+    console.log('📧 Email received:', req.body.email);
+    console.log('🔐 Password received length:', req.body.password?.length);
     
     try {
         const { email, password } = req.body;
         
         if (!email || !password) {
+            console.log('❌ Missing email or password');
             return res.status(400).json({ 
                 success: false,
                 error: 'Email and password are required' 
             });
         }
         
+        console.log('🔍 Querying database for admin with email:', email);
+        
         const result = await pool.query(
-            'SELECT * FROM users WHERE email = $1 AND role = $2',
+            'SELECT user_id, full_name, email, role, status, password FROM users WHERE email = $1 AND role = $2',
             [email, 'ADMIN']
         );
         
+        console.log('📊 Query result rows count:', result.rows.length);
+        
         if (result.rows.length === 0) {
+            console.log('❌ No admin found with email:', email);
             return res.status(401).json({ 
                 success: false,
                 error: 'Invalid admin credentials' 
@@ -1701,9 +1737,15 @@ app.post('/api/auth/admin/login', async (req, res) => {
         }
         
         const admin = result.rows[0];
+        console.log('✅ Admin found:', admin.email);
+        console.log('🔐 Stored password hash (first 20 chars):', admin.password.substring(0, 20));
+        console.log('🔐 Comparing password...');
         
         const validPassword = await bcrypt.compare(password, admin.password);
+        console.log('✅ Password valid result:', validPassword);
+        
         if (!validPassword) {
+            console.log('❌ Invalid password for admin:', email);
             return res.status(401).json({ 
                 success: false,
                 error: 'Invalid admin credentials' 
@@ -1711,6 +1753,7 @@ app.post('/api/auth/admin/login', async (req, res) => {
         }
         
         if (admin.status !== 'ACTIVE') {
+            console.log('❌ Admin account not active:', admin.status);
             return res.status(403).json({ 
                 success: false,
                 error: 'Admin account is deactivated' 
@@ -1730,7 +1773,7 @@ app.post('/api/auth/admin/login', async (req, res) => {
         
         delete admin.password;
         
-        console.log('✅ Admin logged in:', admin.email);
+        console.log('✅ Admin login successful! Token generated for:', admin.email);
         
         res.json({
             success: true,
@@ -1749,6 +1792,11 @@ app.post('/api/auth/admin/login', async (req, res) => {
     }
 });
 
+/**
+ * @route   GET /api/auth/admin/users
+ * @desc    Get all users (admin only)
+ * @access  Private (Admin only)
+ */
 app.get('/api/auth/admin/users', authenticateToken, async (req, res) => {
     try {
         if (req.user.role !== 'ADMIN') {

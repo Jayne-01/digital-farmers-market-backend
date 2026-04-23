@@ -4,7 +4,6 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
 
-// Database connection
 const pool = new Pool({
     user: process.env.DB_USER || 'postgres',
     host: process.env.DB_HOST || 'localhost',
@@ -13,23 +12,52 @@ const pool = new Pool({
     port: process.env.DB_PORT || 5432,
 });
 
-// Authentication middleware
+const isMaintenanceMode = async () => {
+    try {
+        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
+        return result.rows[0]?.maintenance_mode === true;
+    } catch (error) {
+        return false;
+    }
+};
+
+// Maintenance check middleware for API routes
+const checkMaintenanceForAPI = async (req, res, next) => {
+    try {
+        const maintenanceMode = await isMaintenanceMode();
+        if (maintenanceMode && req.user && req.user.role !== 'ADMIN') {
+            return res.status(503).json({ 
+                success: false, 
+                maintenance: true,
+                message: 'System is under maintenance. Please try again later.',
+                redirect: '/maintenance.html'
+            });
+        }
+        next();
+    } catch (error) {
+        next();
+    }
+};
+
+router.get('/maintenance-status', async (req, res) => {
+    try {
+        const maintenanceMode = await isMaintenanceMode();
+        res.json({ maintenance_mode: maintenanceMode });
+    } catch (error) {
+        res.json({ maintenance_mode: false });
+    }
+});
+
 const authenticateToken = async (req, res, next) => {
     try {
         const authHeader = req.headers.authorization;
         const token = authHeader && authHeader.split(' ')[1];
 
         if (!token) {
-            return res.status(401).json({ 
-                success: false, 
-                error: 'Access token required' 
-            });
+            return res.status(401).json({ success: false, error: 'Access token required' });
         }
 
-        const decoded = jwt.verify(
-            token, 
-            process.env.JWT_SECRET || 'your-secret-key-change-in-production'
-        );
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-in-production');
 
         const userResult = await pool.query(
             'SELECT user_id, role, status FROM users WHERE user_id = $1',
@@ -37,17 +65,11 @@ const authenticateToken = async (req, res, next) => {
         );
 
         if (userResult.rows.length === 0) {
-            return res.status(401).json({ 
-                success: false, 
-                error: 'User no longer exists' 
-            });
+            return res.status(401).json({ success: false, error: 'User no longer exists' });
         }
 
         if (userResult.rows[0].status !== 'ACTIVE') {
-            return res.status(403).json({ 
-                success: false, 
-                error: 'Account is deactivated' 
-            });
+            return res.status(403).json({ success: false, error: 'Account is deactivated' });
         }
 
         req.user = {
@@ -60,62 +82,45 @@ const authenticateToken = async (req, res, next) => {
         next();
     } catch (error) {
         if (error.name === 'JsonWebTokenError') {
-            return res.status(403).json({ 
-                success: false, 
-                error: 'Invalid token' 
-            });
+            return res.status(403).json({ success: false, error: 'Invalid token' });
         }
         if (error.name === 'TokenExpiredError') {
-            return res.status(403).json({ 
-                success: false, 
-                error: 'Token expired' 
-            });
+            return res.status(403).json({ success: false, error: 'Token expired' });
         }
         console.error('Auth middleware error:', error);
-        res.status(500).json({ 
-            success: false, 
-            error: 'Authentication error' 
-        });
+        res.status(500).json({ success: false, error: 'Authentication error' });
     }
 };
 
-// POST /api/auth/register
 router.post('/register', async (req, res) => {
     try {
+        const maintenanceMode = await isMaintenanceMode();
+        if (maintenanceMode) {
+            return res.status(503).json({
+                success: false,
+                maintenance: true,
+                message: 'System is under maintenance. Registration is disabled.'
+            });
+        }
+        
         const { full_name, email, password, confirm_password, contact_number, barangay, address } = req.body;
         
-        // Validation
         if (!full_name || !email || !password || !confirm_password) {
-            return res.status(400).json({ 
-                success: false,
-                message: 'Full name, email, password and confirmation are required' 
-            });
+            return res.status(400).json({ success: false, message: 'Full name, email, password and confirmation are required' });
         }
         
         if (password !== confirm_password) {
-            return res.status(400).json({ 
-                success: false,
-                message: 'Passwords do not match' 
-            });
+            return res.status(400).json({ success: false, message: 'Passwords do not match' });
         }
         
-        // Check if user already exists
-        const existingUser = await pool.query(
-            'SELECT * FROM users WHERE email = $1',
-            [email]
-        );
+        const existingUser = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
         
         if (existingUser.rows.length > 0) {
-            return res.status(400).json({ 
-                success: false,
-                message: 'Email already registered' 
-            });
+            return res.status(400).json({ success: false, message: 'Email already registered' });
         }
         
-        // Hash password
         const hashedPassword = await bcrypt.hash(password, 10);
         
-        // Create user
         const result = await pool.query(
             `INSERT INTO users (full_name, email, password, role, contact_number, barangay, address, status, created_at)
              VALUES ($1, $2, $3, 'CUSTOMER', $4, $5, $6, 'ACTIVE', NOW())
@@ -125,104 +130,76 @@ router.post('/register', async (req, res) => {
         
         const user = result.rows[0];
         
-        // Generate token
         const token = jwt.sign(
             { user_id: user.user_id, email: user.email, role: user.role },
             process.env.JWT_SECRET || 'your-secret-key-change-in-production',
             { expiresIn: '7d' }
         );
         
-        res.status(201).json({
-            success: true,
-            message: 'Registration successful!',
-            token,
-            user
-        });
+        res.status(201).json({ success: true, message: 'Registration successful!', token, user });
         
     } catch (error) {
         console.error('Registration error:', error);
-        res.status(500).json({ 
-            success: false,
-            message: 'Internal server error',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
+        res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
 
-// POST /api/auth/login
 router.post('/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         
         if (!email || !password) {
-            return res.status(400).json({ 
-                success: false,
-                message: 'Email and password are required' 
-            });
+            return res.status(400).json({ success: false, message: 'Email and password are required' });
         }
         
-        // Get user from database
-        const result = await pool.query(
-            'SELECT * FROM users WHERE email = $1',
-            [email]
-        );
+        const maintenanceMode = await isMaintenanceMode();
+        
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
         
         if (result.rows.length === 0) {
-            return res.status(401).json({ 
-                success: false,
-                message: 'Invalid email or password' 
-            });
+            return res.status(401).json({ success: false, message: 'Invalid email or password' });
         }
         
         const user = result.rows[0];
         
-        // Check password
         const isValidPassword = await bcrypt.compare(password, user.password);
         if (!isValidPassword) {
-            return res.status(401).json({ 
-                success: false,
-                message: 'Invalid email or password' 
-            });
+            return res.status(401).json({ success: false, message: 'Invalid email or password' });
         }
         
-        // Check if user is active
         if (user.status !== 'ACTIVE') {
-            return res.status(403).json({ 
+            return res.status(403).json({ success: false, message: 'Account is deactivated' });
+        }
+        
+        if (maintenanceMode && user.role !== 'ADMIN') {
+            return res.status(503).json({
                 success: false,
-                message: 'Account is deactivated' 
+                maintenance: true,
+                message: 'System is under maintenance. Only administrators can access the system at this time.'
             });
         }
         
-        // Check farmer verification status if role is FARMER
         let farmer_id = null;
         let isVerifiedFarmer = false;
         
         if (user.role === 'FARMER') {
-            const farmerResult = await pool.query(
-                'SELECT farmer_id, verified_status FROM farmers WHERE user_id = $1',
-                [user.user_id]
-            );
+            const farmerResult = await pool.query('SELECT farmer_id, verified_status FROM farmers WHERE user_id = $1', [user.user_id]);
             if (farmerResult.rows.length > 0) {
                 farmer_id = farmerResult.rows[0].farmer_id;
                 isVerifiedFarmer = farmerResult.rows[0].verified_status;
-                
-                // If farmer is not verified, treat as customer
                 if (!isVerifiedFarmer) {
                     user.role = 'CUSTOMER';
                 }
             }
         }
         
-        // Generate token
         const token = jwt.sign(
             { user_id: user.user_id, email: user.email, role: user.role },
             process.env.JWT_SECRET || 'your-secret-key-change-in-production',
             { expiresIn: '7d' }
         );
         
-        // Remove password from response
         delete user.password;
-        
         user.farmer_id = farmer_id;
         user.is_verified_farmer = isVerifiedFarmer;
         
@@ -230,21 +207,18 @@ router.post('/login', async (req, res) => {
             success: true,
             message: 'Login successful!',
             token,
-            user
+            user,
+            maintenance_mode: maintenanceMode
         });
         
     } catch (error) {
         console.error('Login error:', error);
-        res.status(500).json({ 
-            success: false,
-            message: 'Internal server error',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
+        res.status(500).json({ success: false, message: 'Internal server error' });
     }
 });
 
-// GET /api/auth/profile - Get user profile
-router.get('/profile', authenticateToken, async (req, res) => {
+// Apply maintenance check to ALL protected routes
+router.get('/profile', authenticateToken, checkMaintenanceForAPI, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT u.user_id, u.full_name, u.email, u.role, u.contact_number, 
@@ -257,31 +231,18 @@ router.get('/profile', authenticateToken, async (req, res) => {
         );
         
         if (result.rows.length === 0) {
-            return res.status(404).json({ 
-                success: false,
-                error: 'User not found' 
-            });
+            return res.status(404).json({ success: false, error: 'User not found' });
         }
         
-        res.json({
-            success: true,
-            user: result.rows[0]
-        });
+        res.json({ success: true, user: result.rows[0] });
         
     } catch (error) {
         console.error('Profile error:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to get profile'
-        });
+        res.status(500).json({ success: false, error: 'Failed to get profile' });
     }
 });
 
-// PUT /api/auth/update-profile - Update user profile
-router.put('/update-profile', authenticateToken, async (req, res) => {
-    console.log('📝 Update profile endpoint called');
-    console.log('Request body:', req.body);
-    
+router.put('/update-profile', authenticateToken, checkMaintenanceForAPI, async (req, res) => {
     try {
         const { full_name, contact_number, address, barangay } = req.body;
         const userId = req.user.user_id;
@@ -315,10 +276,7 @@ router.put('/update-profile', authenticateToken, async (req, res) => {
         }
         
         if (updateFields.length === 0) {
-            return res.status(400).json({ 
-                success: false,
-                error: 'At least one field must be provided for update'
-            });
+            return res.status(400).json({ success: false, error: 'At least one field must be provided for update' });
         }
         
         updateFields.push(`updated_at = NOW()`);
@@ -334,29 +292,18 @@ router.put('/update-profile', authenticateToken, async (req, res) => {
         const result = await pool.query(query, values);
         
         if (result.rows.length === 0) {
-            return res.status(404).json({ 
-                success: false,
-                error: 'User not found' 
-            });
+            return res.status(404).json({ success: false, error: 'User not found' });
         }
-        
-        const updatedUser = result.rows[0];
-        
-        console.log('✅ Profile updated for user:', updatedUser.email);
         
         res.json({
             success: true,
             message: 'Profile updated successfully',
-            user: updatedUser
+            user: result.rows[0]
         });
         
     } catch (error) {
-        console.error('❌ Update profile error:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Failed to update profile',
-            details: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
+        console.error('Update profile error:', error);
+        res.status(500).json({ success: false, error: 'Failed to update profile' });
     }
 });
 

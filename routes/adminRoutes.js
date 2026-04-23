@@ -1,13 +1,36 @@
 const express = require('express');
 const router = express.Router();
-const { pool } = require('../config/database'); // <-- THIS is the actual Pool instance
+const { pool } = require('../config/database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { authenticateToken, authorizeRole } = require('../middleware/authMiddleware');
 
 // =====================================================
-// 🔐 CREATE FIRST ADMIN
+// 🔐 HELPER FUNCTION - Check Maintenance Mode
+// =====================================================
+const isMaintenanceMode = async () => {
+    try {
+        const tableCheck = await pool.query(`
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'system_settings'
+            );
+        `);
+        
+        if (!tableCheck.rows[0].exists) {
+            return false;
+        }
+        
+        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
+        return result.rows[0]?.maintenance_mode === true;
+    } catch (error) {
+        console.error('Error checking maintenance mode:', error);
+        return false;
+    }
+};
 
+// =====================================================
+// 🔐 CREATE FIRST ADMIN
 // =====================================================
 router.post('/create-first-admin', async (req, res) => {
     try {
@@ -44,7 +67,6 @@ router.post('/create-first-admin', async (req, res) => {
 
         const admin = result.rows[0];
 
-        // ✅ FIXED TOKEN PAYLOAD
         const token = jwt.sign(
             {
                 id: admin.user_id,
@@ -66,11 +88,13 @@ router.post('/create-first-admin', async (req, res) => {
 });
 
 // =====================================================
-// 🔐 LOGIN
+// 🔐 ADMIN LOGIN (with maintenance mode check)
 // =====================================================
 router.post('/login', async (req, res) => {
     try {
         const { email, password } = req.body;
+        
+        const maintenanceMode = await isMaintenanceMode();
 
         const result = await pool.query(
             `SELECT user_id, full_name, email, password, role, status
@@ -93,7 +117,10 @@ router.post('/login', async (req, res) => {
             return res.status(401).json({ success: false, error: 'Invalid credentials' });
         }
 
-        // ✅ FIXED TOKEN PAYLOAD
+        if (maintenanceMode) {
+            console.log(`⚠️ Maintenance mode ON - Admin ${admin.email} logged in`);
+        }
+
         const token = jwt.sign(
             {
                 id: admin.user_id,
@@ -108,7 +135,8 @@ router.post('/login', async (req, res) => {
         res.json({
             success: true,
             token,
-            user: admin
+            user: admin,
+            maintenance_mode: maintenanceMode
         });
 
     } catch (error) {
@@ -116,64 +144,71 @@ router.post('/login', async (req, res) => {
     }
 });
 
-// ========== DASHBOARD STATS ==========
-// GET /api/admin/analytics - Main analytics summary
+// =====================================================
+// 🏠 MAINTENANCE STATUS (PUBLIC)
+// =====================================================
+router.get('/maintenance-status', async (req, res) => {
+    try {
+        console.log('🔧 Maintenance status check...');
+        const maintenanceMode = await isMaintenanceMode();
+        console.log(`🔧 Maintenance mode is: ${maintenanceMode ? 'ON' : 'OFF'}`);
+        res.json({ maintenance_mode: maintenanceMode });
+    } catch (error) {
+        console.error('❌ Maintenance status error:', error);
+        res.json({ maintenance_mode: false });
+    }
+});
+
+// =====================================================
+// 📊 DASHBOARD STATS
+// =====================================================
+
 router.get('/analytics', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         console.log('📊 Fetching analytics summary...');
         
-        // Get total users count
         const usersQuery = await pool.query('SELECT COUNT(*) FROM users');
         const totalUsers = parseInt(usersQuery.rows[0].count) || 0;
         
-        // Get farmers count
         const farmersQuery = await pool.query('SELECT COUNT(*) FROM farmers');
         const totalFarmers = parseInt(farmersQuery.rows[0].count) || 0;
         
-        // Get customers count (users who are not farmers)
         const customersQuery = await pool.query(
             'SELECT COUNT(*) FROM users WHERE role = $1',
             ['CUSTOMER']
         );
         const totalCustomers = parseInt(customersQuery.rows[0].count) || 0;
         
-        // Get total products
         const productsQuery = await pool.query('SELECT COUNT(*) FROM products');
         const totalProducts = parseInt(productsQuery.rows[0].count) || 0;
         
-        // Get available products
         const availableProductsQuery = await pool.query(
             'SELECT COUNT(*) FROM products WHERE status = $1',
             ['AVAILABLE']
         );
         const availableProducts = parseInt(availableProductsQuery.rows[0].count) || 0;
         
-        // Get pending products
         const pendingProductsQuery = await pool.query(
             'SELECT COUNT(*) FROM products WHERE status = $1',
             ['PENDING']
         );
         const pendingProducts = parseInt(pendingProductsQuery.rows[0].count) || 0;
         
-        // Get total orders
         const ordersQuery = await pool.query('SELECT COUNT(*) FROM orders');
         const totalOrders = parseInt(ordersQuery.rows[0].count) || 0;
         
-        // Get pending orders
         const pendingOrdersQuery = await pool.query(
             'SELECT COUNT(*) FROM orders WHERE order_status = $1',
             ['PENDING']
         );
         const pendingOrders = parseInt(pendingOrdersQuery.rows[0].count) || 0;
         
-        // Get completed orders (delivered)
         const completedOrdersQuery = await pool.query(
             'SELECT COUNT(*) FROM orders WHERE order_status = $1',
             ['DELIVERED']
         );
         const completedOrders = parseInt(completedOrdersQuery.rows[0].count) || 0;
         
-        // Get total revenue (sum of all delivered orders)
         const revenueQuery = await pool.query(
             'SELECT COALESCE(SUM(total_amount), 0) as total FROM orders WHERE order_status = $1',
             ['DELIVERED']
@@ -209,7 +244,6 @@ router.get('/analytics', authenticateToken, authorizeRole('ADMIN'), async (req, 
     }
 });
 
-// GET /api/admin/analytics/user-growth - User growth over time
 router.get('/analytics/user-growth', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const days = parseInt(req.query.days) || 30;
@@ -284,7 +318,6 @@ router.get('/analytics/user-growth', authenticateToken, authorizeRole('ADMIN'), 
     }
 });
 
-// GET /api/admin/analytics/sales - Sales overview over time
 router.get('/analytics/sales', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const days = parseInt(req.query.days) || 30;
@@ -358,8 +391,10 @@ router.get('/analytics/sales', authenticateToken, authorizeRole('ADMIN'), async 
     }
 });
 
-// ========== USER MANAGEMENT ==========
-// GET /api/admin/users - Get all users
+// =====================================================
+// 👥 USER MANAGEMENT
+// =====================================================
+
 router.get('/users', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const limit = parseInt(req.query.limit) || 50;
@@ -392,7 +427,6 @@ router.get('/users', authenticateToken, authorizeRole('ADMIN'), async (req, res)
     }
 });
 
-// GET /api/admin/users/:id - Get single user
 router.get('/users/:id', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -427,7 +461,6 @@ router.get('/users/:id', authenticateToken, authorizeRole('ADMIN'), async (req, 
     }
 });
 
-// PUT /api/admin/users/:id/status - Update user status
 router.put('/users/:id/status', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -450,8 +483,10 @@ router.put('/users/:id/status', authenticateToken, authorizeRole('ADMIN'), async
     }
 });
 
-// ========== FARMER MANAGEMENT ==========
-// GET /api/admin/farmers - Get all farmers (with contact_number and barangay from users table)
+// =====================================================
+// 🚜 FARMER MANAGEMENT
+// =====================================================
+
 router.get('/farmers', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const query = `
@@ -469,10 +504,10 @@ router.get('/farmers', authenticateToken, authorizeRole('ADMIN'), async (req, re
                 u.status as user_status
             FROM farmers f
             JOIN users u ON f.user_id = u.user_id
-            ORDER BY u.created_at DESC
+            ORDER BY f.created_at DESC
         `;
         
-        const result = await pool.query('SELECT * FROM farmers ORDER BY created_at DESC');
+        const result = await pool.query(query);
         
         res.json({
             success: true,
@@ -484,7 +519,6 @@ router.get('/farmers', authenticateToken, authorizeRole('ADMIN'), async (req, re
     }
 });
 
-// GET /api/admin/farmers/pending-verifications - Get pending farmers (with contact_number and barangay from users table)
 router.get('/farmers/pending-verifications', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const result = await pool.query(`
@@ -510,20 +544,17 @@ router.get('/farmers/pending-verifications', authenticateToken, authorizeRole('A
     }
 });
 
-// PATCH /api/admin/farmers/:id/verify - Verify a farmer
 router.patch('/farmers/:id/verify', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     const farmerId = req.params.id;
     const { verified_status } = req.body;
 
-    // Get a client from the pool
     const client = await pool.connect();
 
     try {
         console.log(`🔍 Verifying farmer ID: ${farmerId}, Status: ${verified_status}`);
 
-        await client.query('BEGIN'); // start transaction
+        await client.query('BEGIN');
 
-        // Get farmer and associated user
         const farmerResult = await client.query(`
             SELECT f.farmer_id, f.user_id, f.verified_status, u.email, u.full_name, u.contact_number, u.barangay
             FROM farmers f
@@ -538,12 +569,10 @@ router.patch('/farmers/:id/verify', authenticateToken, authorizeRole('ADMIN'), a
 
         const farmer = farmerResult.rows[0];
 
-        // If rejecting, delete farmer
         if (verified_status === false || verified_status === 'false') {
             await client.query(`DELETE FROM farmers WHERE farmer_id = $1`, [farmerId]);
             console.log(`❌ Farmer application ${farmerId} rejected and removed`);
         } else {
-            // Otherwise, update verification status
             const result = await client.query(`
                 UPDATE farmers
                 SET verified_status = $1, updated_at = NOW()
@@ -551,7 +580,6 @@ router.patch('/farmers/:id/verify', authenticateToken, authorizeRole('ADMIN'), a
                 RETURNING *
             `, [verified_status, farmerId]);
 
-            // If verifying, also update user role
             if (verified_status === true || verified_status === 'true') {
                 await client.query(`
                     UPDATE users
@@ -562,7 +590,7 @@ router.patch('/farmers/:id/verify', authenticateToken, authorizeRole('ADMIN'), a
             }
         }
 
-        await client.query('COMMIT'); // commit transaction
+        await client.query('COMMIT');
 
         const message = (verified_status === true || verified_status === 'true')
             ? `Farmer ${farmer.full_name} has been verified and can now sell products`
@@ -581,12 +609,14 @@ router.patch('/farmers/:id/verify', authenticateToken, authorizeRole('ADMIN'), a
         console.error('Error verifying farmer:', error);
         res.status(500).json({ success: false, error: error.message });
     } finally {
-        client.release(); // release client back to pool
+        client.release();
     }
 });
 
-// ========== PRODUCT MANAGEMENT ==========
-// GET /api/admin/products - Get all products
+// =====================================================
+// 📦 PRODUCT MANAGEMENT
+// =====================================================
+
 router.get('/products', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const query = `
@@ -619,7 +649,6 @@ router.get('/products', authenticateToken, authorizeRole('ADMIN'), async (req, r
     }
 });
 
-// PATCH /api/admin/products/:id/status - Update product status
 router.patch('/products/:id/status', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -642,8 +671,10 @@ router.patch('/products/:id/status', authenticateToken, authorizeRole('ADMIN'), 
     }
 });
 
-// ========== ORDER MANAGEMENT ==========
-// GET /api/admin/orders - Get all orders
+// =====================================================
+// 📋 ORDER MANAGEMENT
+// =====================================================
+
 router.get('/orders', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const query = `
@@ -677,7 +708,6 @@ router.get('/orders', authenticateToken, authorizeRole('ADMIN'), async (req, res
     }
 });
 
-// PATCH /api/admin/orders/:id - Update order status
 router.patch('/orders/:id', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const { id } = req.params;
@@ -700,12 +730,12 @@ router.patch('/orders/:id', authenticateToken, authorizeRole('ADMIN'), async (re
     }
 });
 
-// ========== SETTINGS MANAGEMENT ==========
-// ========== SETTINGS MANAGEMENT ==========
-// GET /api/admin/settings - Get system settings
+// =====================================================
+// ⚙️ SETTINGS MANAGEMENT
+// =====================================================
+
 router.get('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
-        // Check if system_settings table exists
         const checkTable = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -714,7 +744,19 @@ router.get('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
         `);
         
         if (!checkTable.rows[0].exists) {
-            // Return default settings if table doesn't exist
+            await pool.query(`
+                CREATE TABLE IF NOT EXISTS system_settings (
+                    id SERIAL PRIMARY KEY,
+                    platform_name VARCHAR(255) DEFAULT 'Digital Farmers Market',
+                    support_email VARCHAR(255) DEFAULT 'support@digitalfarmers.com',
+                    support_phone VARCHAR(50) DEFAULT '09123456789',
+                    cod_enabled BOOLEAN DEFAULT true,
+                    maintenance_mode BOOLEAN DEFAULT false,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_by INT
+                )
+            `);
+            
             return res.json({
                 success: true,
                 settings: {
@@ -727,11 +769,9 @@ router.get('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
             });
         }
         
-        // Get settings from database
         const result = await pool.query('SELECT * FROM system_settings LIMIT 1');
         
         if (result.rows.length === 0) {
-            // Return default settings if no row exists
             return res.json({
                 success: true,
                 settings: {
@@ -765,12 +805,12 @@ router.get('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
     }
 });
 
-// PUT /api/admin/settings - Update system settings
 router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const { settings } = req.body;
         
-        // Check if system_settings table exists
+        console.log('⚙️ Updating settings:', settings);
+        
         const checkTable = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -779,7 +819,6 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
         `);
         
         if (!checkTable.rows[0].exists) {
-            // Create the table if it doesn't exist
             await pool.query(`
                 CREATE TABLE system_settings (
                     id SERIAL PRIMARY KEY,
@@ -794,12 +833,10 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
             `);
         }
         
-        // Check if settings row exists
         const checkSettings = await pool.query('SELECT COUNT(*) FROM system_settings');
         
         let result;
         if (parseInt(checkSettings.rows[0].count) > 0) {
-            // Update existing settings
             const query = `
                 UPDATE system_settings 
                 SET platform_name = $1,
@@ -815,12 +852,11 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
                 settings.platform_name,
                 settings.support_email,
                 settings.support_phone,
-                settings.cod_enabled,
-                settings.maintenance_mode,
+                settings.cod_enabled !== undefined ? settings.cod_enabled : true,
+                settings.maintenance_mode === true || settings.maintenance_mode === 'true',
                 req.user.id
             ]);
         } else {
-            // Insert new settings
             const query = `
                 INSERT INTO system_settings 
                 (platform_name, support_email, support_phone, cod_enabled, maintenance_mode, updated_by)
@@ -831,11 +867,13 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
                 settings.platform_name,
                 settings.support_email,
                 settings.support_phone,
-                settings.cod_enabled,
-                settings.maintenance_mode,
+                settings.cod_enabled !== undefined ? settings.cod_enabled : true,
+                settings.maintenance_mode === true || settings.maintenance_mode === 'true',
                 req.user.id
             ]);
         }
+        
+        console.log(`✅ Settings updated. Maintenance mode: ${settings.maintenance_mode}`);
         
         res.json({
             success: true,
@@ -852,8 +890,10 @@ router.put('/settings', authenticateToken, authorizeRole('ADMIN'), async (req, r
     }
 });
 
-// ========== ADMIN LOGS ==========
-// GET /api/admin/settings/logs - Get admin action logs
+// =====================================================
+// 📜 ADMIN LOGS
+// =====================================================
+
 router.get('/settings/logs', authenticateToken, authorizeRole('ADMIN'), async (req, res) => {
     try {
         const checkTable = await pool.query(`
@@ -897,35 +937,4 @@ router.get('/settings/logs', authenticateToken, authorizeRole('ADMIN'), async (r
     }
 });
 
-// GET /api/maintenance-status - Public endpoint to check maintenance status
-// ========== MAINTENANCE STATUS (PUBLIC) ==========
-// GET /api/maintenance-status - Public endpoint for frontend to check maintenance mode
-router.get('/maintenance-status', async (req, res) => {
-    try {
-        console.log('🔧 Maintenance status check...');
-        
-        // Check if system_settings table exists
-        const tableCheck = await pool.query(`
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'system_settings'
-            );
-        `);
-        
-        if (!tableCheck.rows[0].exists) {
-            console.log('📋 system_settings table not found, maintenance_mode = false');
-            return res.json({ maintenance_mode: false });
-        }
-        
-        const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
-        const maintenance_mode = result.rows[0]?.maintenance_mode === true;
-        
-        console.log(`🔧 Maintenance mode is: ${maintenance_mode ? 'ON' : 'OFF'}`);
-        res.json({ maintenance_mode });
-        
-    } catch (error) {
-        console.error('❌ Maintenance status error:', error);
-        res.json({ maintenance_mode: false });
-    }
-});
 module.exports = router;
