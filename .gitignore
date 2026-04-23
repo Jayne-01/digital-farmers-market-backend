@@ -24,5 +24,7 @@ temp/
 .DS_Store
 Thumbs.db
 
+uploads/
+
 # Model files (optional - keep if you want to save trained models)
 # *.h5

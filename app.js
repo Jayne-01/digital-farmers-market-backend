@@ -1,3 +1,10 @@
+require('dotenv').config();
+console.log('=== ENV VARIABLE CHECK ===');
+console.log('DATABASE_URL:', process.env.DATABASE_URL ? 'SET (length: ' + process.env.DATABASE_URL.length + ')' : 'NOT SET');
+console.log('DB_USER:', process.env.DB_USER ? 'SET' : 'NOT SET');
+console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
+console.log('==========================');
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -8,7 +15,6 @@ const jwt = require('jsonwebtoken');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const { Pool } = require('pg');
-require('dotenv').config();
 
 // Import routes
 const productRoutes = require('./routes/productRoutes');
@@ -23,43 +29,91 @@ const classifyRoutes = require('./routes/classify');
 
 const app = express();
 
-// Database connection with improved configuration
-const pool = new Pool({
-    user: process.env.DB_USER || 'postgres',
-    host: process.env.DB_HOST || 'localhost',
-    database: process.env.DB_NAME || 'Digital-Farm-Market',
-    password: process.env.DB_PASSWORD || '010124',
-    port: process.env.DB_PORT || 5432,
-    max: 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 2000,
-});
+// ========== DATABASE CONNECTION CONFIGURATION ==========
+let poolConfig;
+
+// First try using DATABASE_URL (preferred method)
+if (process.env.DATABASE_URL) {
+    console.log('✅ Using DATABASE_URL for database connection');
+    poolConfig = {
+        connectionString: process.env.DATABASE_URL,
+        ssl: {
+            rejectUnauthorized: false,
+            require: true
+        },
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+    };
+}
+// Fallback to individual variables
+else if (process.env.DB_USER && process.env.DB_HOST) {
+    console.log('⚠️ Using individual database variables');
+    poolConfig = {
+        user: process.env.DB_USER,
+        host: process.env.DB_HOST,
+        database: process.env.DB_NAME,
+        password: process.env.DB_PASSWORD,
+        port: process.env.DB_PORT || 5432,
+        ssl: {
+            rejectUnauthorized: false,
+            require: true
+        },
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+    };
+}
+// Local development fallback
+else {
+    console.log('⚠️ Using local database configuration');
+    poolConfig = {
+        user: 'postgres',
+        host: 'localhost',
+        database: 'Digital-Farm-Market',
+        password: '010124',
+        port: 5432,
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+    };
+}
+
+const pool = new Pool(poolConfig);
 
 // Make db available to routes
 app.locals.db = pool;
 app.locals.pool = pool;
 
 // Test database connection with retry logic
-const connectWithRetry = async () => {
+const connectWithRetry = async (retryCount = 0) => {
+    const maxRetries = 10;
     try {
-        await pool.connect();
-        console.log('✅ Connected to PostgreSQL database');
+        const client = await pool.connect();
+        console.log('✅ Connected to PostgreSQL database successfully');
         
-        const testResult = await pool.query('SELECT NOW() as current_time');
+        const testResult = await client.query('SELECT NOW() as current_time, version() as version');
         console.log(`   Database time: ${testResult.rows[0].current_time}`);
+        console.log(`   PostgreSQL version: ${testResult.rows[0].version.split(',')[0]}`);
+        client.release();
     } catch (err) {
         console.error('❌ Database connection error:', err.message);
-        console.log('🔄 Retrying in 5 seconds...');
-        setTimeout(connectWithRetry, 5000);
+        if (retryCount < maxRetries) {
+            console.log(`🔄 Retrying in 5 seconds... (Attempt ${retryCount + 1}/${maxRetries})`);
+            setTimeout(() => connectWithRetry(retryCount + 1), 5000);
+        } else {
+            console.error('❌ Failed to connect to database after maximum retries');
+            console.error('Please check your DATABASE_URL environment variable');
+        }
     }
 };
 
+// Start connection attempt
 connectWithRetry();
 
 // Handle pool errors
 pool.on('error', (err) => {
     console.error('Unexpected error on idle client', err);
-    process.exit(-1);
 });
 
 // ========== HELPER FUNCTION TO CHECK MAINTENANCE MODE ==========
@@ -79,7 +133,7 @@ async function isMaintenanceMode() {
         const result = await pool.query('SELECT maintenance_mode FROM system_settings LIMIT 1');
         return result.rows[0]?.maintenance_mode === true;
     } catch (error) {
-        console.error('Maintenance check error:', error);
+        console.error('Maintenance check error:', error.message);
         return false;
     }
 }
@@ -1893,8 +1947,12 @@ const randomForest = require('./services/ml/randomForestPredictor');
 // Train model after database connection is established
 setTimeout(async () => {
     console.log('🤖 Initializing Random Forest ML model...');
-    await randomForest.trainModel();
-    console.log('✅ ML model ready');
+    try {
+        await randomForest.trainModel();
+        console.log('✅ ML model ready');
+    } catch (error) {
+        console.error('❌ Failed to train ML model:', error.message);
+    }
 }, 5000);
 
 // ========== ERROR HANDLING ==========
@@ -1985,19 +2043,18 @@ app.use('*', (req, res) => {
 
 // ========== START SERVER ==========
 const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || 'localhost';
 
-const server = app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('\n' + '='.repeat(70));
     console.log('🚀 DIGITAL FARMERS MARKET BACKEND SERVER');
     console.log('='.repeat(70));
-    console.log(`📡 Server URL:      http://${HOST}:${PORT}`);
-    console.log(`📊 Health check:    http://${HOST}:${PORT}/health`);
+    console.log(`📡 Server URL:      http://0.0.0.0:${PORT}`);
+    console.log(`📊 Health check:    http://0.0.0.0:${PORT}/health`);
     console.log(`🕒 Started at:      ${new Date().toLocaleString()}`);
     console.log(`🔧 Environment:     ${process.env.NODE_ENV || 'development'}`);
-    console.log(`💾 Database:        Digital-Farm-Market on ${process.env.DB_HOST || 'localhost'}`);
+    console.log(`💾 Database:        ${process.env.DATABASE_URL ? 'Connected to Render PostgreSQL' : 'Using local database'}`);
     console.log(`🔐 Google OAuth:    ${process.env.GOOGLE_CLIENT_ID ? '✅ Configured' : '❌ Not configured'}`);
-    console.log(`🔧 Maintenance API: http://${HOST}:${PORT}/api/maintenance-status`);
+    console.log(`🔧 Maintenance API: http://0.0.0.0:${PORT}/api/maintenance-status`);
     console.log('='.repeat(70) + '\n');
 });
 
