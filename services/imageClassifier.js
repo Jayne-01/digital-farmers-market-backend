@@ -3,19 +3,24 @@ const FormData = require('form-data');
 const path = require('path');
 const fs = require('fs');
 
-// Get from environment variables
-const CLASSIFIER_URL = process.env.CLASSIFIER_URL || 'http://localhost:5002';
+// Get from environment variables - FIXED to use correct variable name
+const CLASSIFIER_URL = process.env.CLASSIFIER_URL || process.env.AI_SERVICE_URL || 'https://farm-classifier.onrender.com';
 const CLASSIFIER_TIMEOUT = parseInt(process.env.CLASSIFIER_TIMEOUT) || 30000;
 
 class ImageClassifier {
     constructor() {
         this.classifierUrl = CLASSIFIER_URL;
         this.timeout = CLASSIFIER_TIMEOUT;
+        console.log(`✅ Classifier initialized with URL: ${this.classifierUrl}`);
     }
 
     async healthCheck() {
         try {
-            const response = await axios.get(`${this.classifierUrl}/classify/health`);
+            console.log(`Checking classifier health at: ${this.classifierUrl}/classify/health`);
+            const response = await axios.get(`${this.classifierUrl}/classify/health`, {
+                timeout: 10000
+            });
+            console.log('Health check response:', response.data);
             return response.data;
         } catch (error) {
             console.error('Classifier health check failed:', error.message);
@@ -28,18 +33,28 @@ class ImageClassifier {
             const formData = new FormData();
             formData.append('image', imageBuffer, filename);
 
+            console.log(`Calling classifier at: ${this.classifierUrl}/classify/predict`);
+            
             const response = await axios.post(
                 `${this.classifierUrl}/classify/predict`,
                 formData,
                 {
-                    headers: formData.getHeaders(),
+                    headers: {
+                        ...formData.getHeaders(),
+                        'Accept': 'application/json'
+                    },
                     timeout: this.timeout
                 }
             );
 
+            console.log('Classification successful:', response.data);
             return response.data;
         } catch (error) {
-            console.error('Image classification failed:', error.message);
+            console.error('Image classification failed:');
+            console.error('  URL:', `${this.classifierUrl}/classify/predict`);
+            console.error('  Status:', error.response?.status);
+            console.error('  Response:', error.response?.data);
+            console.error('  Message:', error.message);
             throw new Error(`Classification failed: ${error.message}`);
         }
     }
