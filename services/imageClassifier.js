@@ -5,7 +5,7 @@ const fs = require('fs');
 
 // Get from environment variables - FIXED to use correct variable name
 const CLASSIFIER_URL = process.env.CLASSIFIER_URL || process.env.AI_SERVICE_URL || 'https://farm-classifier.onrender.com';
-const CLASSIFIER_TIMEOUT = parseInt(process.env.CLASSIFIER_TIMEOUT) || 30000;
+const CLASSIFIER_TIMEOUT = parseInt(process.env.CLASSIFIER_TIMEOUT) || 60000;
 
 class ImageClassifier {
     constructor() {

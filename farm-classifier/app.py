@@ -34,6 +34,10 @@ model = None
 class_names = ['fruits', 'vegetables', 'crops', 'rice']
 model_loaded = False
 
+# Optimize TensorFlow for faster inference
+tf.config.threading.set_intra_op_parallelism_threads(2)
+tf.config.threading.set_inter_op_parallelism_threads(2)
+
 try:
     if os.path.exists(MODEL_PATH):
         model = tf.keras.models.load_model(MODEL_PATH)
@@ -180,6 +184,20 @@ def predict_base64():
 @app.route('/classify/classes', methods=['GET'])
 def get_classes():
     return jsonify({'classes': class_names, 'count': len(class_names)})
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        'service': 'Farm Image Classifier API',
+        'status': 'running',
+        'model_loaded': model_loaded,
+        'endpoints': {
+            'health': '/classify/health',
+            'predict': '/classify/predict (POST)',
+            'predict_base64': '/classify/predict-base64 (POST)',
+            'classes': '/classify/classes'
+        }
+    })
 
 if __name__ == '__main__':
     print("=" * 50)
