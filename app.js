@@ -15,7 +15,7 @@ const jwt = require('jsonwebtoken');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const { Pool } = require('pg');
-const axios = require('axios'); // <-- ADDED THIS LINE
+const axios = require('axios');
 
 // Import routes
 const productRoutes = require('./routes/productRoutes');
@@ -31,7 +31,7 @@ const classifyRoutes = require('./routes/classify');
 const app = express();
 
 // ========== CLASSIFIER KEEP-ALIVE PING ==========
-// Prevents Render free tier from sleeping and causing timeouts
+// FIXED: Removed duplicate https:// - just use the URL directly
 const CLASSIFIER_URL = process.env.CLASSIFIER_URL || 'https://farm-classifier.onrender.com';
 const KEEP_ALIVE_INTERVAL = 4 * 60 * 1000; // Every 4 minutes
 
@@ -52,10 +52,10 @@ async function pingClassifier() {
 
 // Start keep-alive after server starts
 setTimeout(() => {
-    pingClassifier(); // Initial ping
+    pingClassifier();
     setInterval(pingClassifier, KEEP_ALIVE_INTERVAL);
     console.log('🔄 Classifier keep-alive service started (pings every 4 minutes)');
-}, 5000); // Wait 5 seconds after server start
+}, 5000);
 // ============================================
 
 // ========== DATABASE CONNECTION CONFIGURATION ==========
@@ -2070,9 +2070,11 @@ app.use('*', (req, res) => {
     });
 });
 
-// ========== START SERVER ==========
+// ========== START SERVER - FIXED FOR RENDER ==========
+// IMPORTANT: Use PORT from environment variable (Render sets this to 10000)
 const PORT = process.env.PORT || 3000;
 
+// Bind to 0.0.0.0 to accept connections from outside the container
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('\n' + '='.repeat(70));
     console.log('🚀 DIGITAL FARMERS MARKET BACKEND SERVER');
