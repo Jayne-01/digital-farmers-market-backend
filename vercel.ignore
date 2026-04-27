@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.git/
+README.md
+test_images/
+*.h5
+!models/*.h5

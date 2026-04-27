@@ -9,50 +9,75 @@ import json
 import io
 from PIL import Image
 import base64
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-
-# Get configuration from .env
-PORT = int(os.getenv('PORT', 5002))
-HOST = os.getenv('HOST', '0.0.0.0')
-DEBUG = os.getenv('DEBUG', 'True').lower() == 'true'
-MODEL_PATH = os.getenv('MODEL_PATH', 'models/farm_classifier.h5')
-CLASS_NAMES_PATH = os.getenv('CLASS_NAMES_PATH', 'models/class_names.json')
-UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads')
-ALLOWED_EXTENSIONS = set(os.getenv('ALLOWED_EXTENSIONS', 'png,jpg,jpeg,gif,bmp').split(','))
+import tempfile
 
 app = Flask(__name__)
 CORS(app)
 
+# ============= CONFIGURATION =============
+# Use /tmp for Vercel serverless environment
+UPLOAD_FOLDER = '/tmp/uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
+
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Load model
+# ============= LOAD MODEL =============
 model = None
 class_names = ['fruits', 'vegetables', 'crops', 'rice']
 model_loaded = False
 
-# Optimize TensorFlow for faster inference
-tf.config.threading.set_intra_op_parallelism_threads(2)
-tf.config.threading.set_inter_op_parallelism_threads(2)
+# Optimize TensorFlow for serverless environment
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
 
-try:
-    if os.path.exists(MODEL_PATH):
-        model = tf.keras.models.load_model(MODEL_PATH)
-        model_loaded = True
-        print("✓ Model loaded successfully!")
-    else:
-        print(f"⚠️ Model not found at {MODEL_PATH}")
+# Get model paths - try multiple locations for Vercel
+MODEL_PATHS = [
+    'models/farm_classifier.h5',
+    'model/farm_classifier.h5',
+    'farm_classifier.h5',
+    '/tmp/models/farm_classifier.h5'
+]
+
+CLASS_NAMES_PATHS = [
+    'models/class_names.json',
+    'model/class_names.json',
+    'class_names.json',
+    '/tmp/models/class_names.json'
+]
+
+def load_model_and_classes():
+    global model, class_names, model_loaded
     
-    if os.path.exists(CLASS_NAMES_PATH):
-        with open(CLASS_NAMES_PATH, 'r') as f:
-            class_names = json.load(f)
-    print(f"✓ Classes: {class_names}")
-except Exception as e:
-    print(f"⚠️ Error loading model: {e}")
+    # Load class names
+    for class_path in CLASS_NAMES_PATHS:
+        if os.path.exists(class_path):
+            try:
+                with open(class_path, 'r') as f:
+                    class_names = json.load(f)
+                print(f"✓ Class names loaded from {class_path}")
+                break
+            except Exception as e:
+                print(f"⚠️ Error loading class names from {class_path}: {e}")
+    
+    # Load model
+    for model_path in MODEL_PATHS:
+        if os.path.exists(model_path):
+            try:
+                model = tf.keras.models.load_model(model_path)
+                model_loaded = True
+                print(f"✓ Model loaded successfully from {model_path}")
+                return
+            except Exception as e:
+                print(f"⚠️ Error loading model from {model_path}: {e}")
+    
+    if not model_loaded:
+        print("⚠️ No model found. Running in demo mode.")
 
+# Load model on startup
+load_model_and_classes()
+
+# ============= HELPER FUNCTIONS =============
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -67,32 +92,59 @@ def preprocess_image(img_path):
 def predict_from_array(img_array):
     """Make prediction from preprocessed array"""
     if model is None:
-        return None, 0, {}
+        # Demo mode - return mock prediction
+        return 'rice', 85.5, {c: 25.0 for c in class_names}
     
     predictions = model.predict(img_array, verbose=0)[0]
     predicted_idx = np.argmax(predictions)
     predicted_class = class_names[predicted_idx]
-    confidence = float(predictions[predicted_idx])
+    confidence = float(predictions[predicted_idx]) * 100
     
     all_probabilities = {}
     for i, class_name in enumerate(class_names):
-        all_probabilities[class_name] = float(predictions[i])
+        all_probabilities[class_name] = float(predictions[i]) * 100
     
     return predicted_class, confidence, all_probabilities
+
+# ============= ROUTES =============
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        'service': 'Farm Image Classifier API',
+        'status': 'running',
+        'model_loaded': model_loaded,
+        'demo_mode': model is None,
+        'endpoints': {
+            'health': '/classify/health',
+            'predict': '/classify/predict (POST)',
+            'predict_base64': '/classify/predict-base64 (POST)',
+            'classes': '/classify/classes'
+        }
+    })
 
 @app.route('/classify/health', methods=['GET'])
 def health_check():
     return jsonify({
-        'status': 'healthy', 
+        'status': 'healthy',
         'model_loaded': model_loaded,
-        'classes': class_names
+        'classes': class_names,
+        'demo_mode': model is None
     })
 
-@app.route('/classify/predict', methods=['POST'])
+@app.route('/classify/predict', methods=['POST', 'OPTIONS'])
 def predict_image():
     """Predict image category from file upload"""
-    if not model_loaded:
-        return jsonify({'error': 'Model not loaded. Please train the model first.'}), 503
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    if model is None:
+        return jsonify({
+            'success': True,
+            'prediction': 'rice',
+            'confidence': 85.5,
+            'demo_mode': True,
+            'message': 'Demo mode - Model not loaded, returning mock prediction'
+        })
     
     # Check for file upload
     if 'image' not in request.files:
@@ -104,45 +156,58 @@ def predict_image():
         return jsonify({'error': 'No image selected'}), 400
     
     if not allowed_file(file.filename):
-        return jsonify({'error': 'File type not allowed. Allowed: png, jpg, jpeg, gif, bmp'}), 400
+        return jsonify({'error': f'File type not allowed. Allowed: {", ".join(ALLOWED_EXTENSIONS)}'}), 400
     
+    filepath = None
     try:
+        # Save to temporary file
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
         
+        # Preprocess and predict
         img_array = preprocess_image(filepath)
         predicted_class, confidence, all_probabilities = predict_from_array(img_array)
-        
-        os.remove(filepath)
-        
-        # Return confidence as percentage (0-100)
-        confidence_percent = round(confidence * 100, 2)
         
         return jsonify({
             'success': True,
             'prediction': predicted_class,
-            'confidence': confidence_percent,
-            'probabilities': {k: round(v * 100, 2) for k, v in all_probabilities.items()}
+            'confidence': round(confidence, 2),
+            'probabilities': {k: round(v, 2) for k, v in all_probabilities.items()}
         })
         
     except Exception as e:
-        # Clean up if file exists
-        if 'filepath' in locals() and os.path.exists(filepath):
-            os.remove(filepath)
         return jsonify({'error': str(e)}), 500
+    
+    finally:
+        # Clean up temp file
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except:
+                pass
 
-@app.route('/classify/predict-base64', methods=['POST'])
+@app.route('/classify/predict-base64', methods=['POST', 'OPTIONS'])
 def predict_base64():
     """Predict image category from base64 string"""
-    if not model_loaded:
-        return jsonify({'error': 'Model not loaded. Please train the model first.'}), 503
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    if model is None:
+        return jsonify({
+            'success': True,
+            'prediction': 'rice',
+            'confidence': 85.5,
+            'demo_mode': True,
+            'message': 'Demo mode - Model not loaded, returning mock prediction'
+        })
     
     data = request.get_json()
     
     if not data or 'image' not in data:
         return jsonify({'error': 'No image data provided'}), 400
     
+    filepath = None
     try:
         # Decode base64 image
         image_data = data['image']
@@ -156,56 +221,53 @@ def predict_base64():
         if img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # Save temporarily
-        filename = f"temp_{os.urandom(8).hex()}.jpg"
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        img.save(filepath)
+        # Save to temporary file using tempfile
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False, dir=UPLOAD_FOLDER) as tmp:
+            filepath = tmp.name
+            img.save(filepath)
         
         img_array = preprocess_image(filepath)
         predicted_class, confidence, all_probabilities = predict_from_array(img_array)
         
-        os.remove(filepath)
-        
-        # Return confidence as percentage (0-100)
-        confidence_percent = round(confidence * 100, 2)
-        
         return jsonify({
             'success': True,
             'prediction': predicted_class,
-            'confidence': confidence_percent,
-            'probabilities': {k: round(v * 100, 2) for k, v in all_probabilities.items()}
+            'confidence': round(confidence, 2),
+            'probabilities': {k: round(v, 2) for k, v in all_probabilities.items()}
         })
         
     except Exception as e:
-        if 'filepath' in locals() and os.path.exists(filepath):
-            os.remove(filepath)
         return jsonify({'error': str(e)}), 500
+    
+    finally:
+        # Clean up temp file
+        if filepath and os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except:
+                pass
 
 @app.route('/classify/classes', methods=['GET'])
 def get_classes():
-    return jsonify({'classes': class_names, 'count': len(class_names)})
-
-@app.route('/', methods=['GET'])
-def home():
     return jsonify({
-        'service': 'Farm Image Classifier API',
-        'status': 'running',
-        'model_loaded': model_loaded,
-        'endpoints': {
-            'health': '/classify/health',
-            'predict': '/classify/predict (POST)',
-            'predict_base64': '/classify/predict-base64 (POST)',
-            'classes': '/classify/classes'
-        }
+        'classes': class_names,
+        'count': len(class_names),
+        'model_loaded': model_loaded
     })
 
+# ============= VERCEL HANDLER =============
+# This is required for Vercel serverless deployment
+def handler(request, context):
+    """Vercel serverless function handler"""
+    return app(request.environ, lambda x, y: None)
+
+# ============= MAIN =============
 if __name__ == '__main__':
     print("=" * 50)
     print("FARM IMAGE CLASSIFIER API")
     print("=" * 50)
     print(f"Model loaded: {model_loaded}")
     print(f"Classes: {class_names}")
-    port = int(os.environ.get('PORT', 5002))
-    print(f"Server: http://0.0.0.0:{port}")
+    print(f"Server: http://0.0.0.0:5002")
     print("=" * 50)
-    app.run(debug=False, port=port, host='0.0.0.0')
+    app.run(debug=False, port=5002, host='0.0.0.0')

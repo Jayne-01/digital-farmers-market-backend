@@ -28,3 +28,4 @@ uploads/
 
 # Model files (optional - keep if you want to save trained models)
 # *.h5
+.vercel

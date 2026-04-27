@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "app.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/classify",
+      "dest": "app.py"
+    },
+    {
+      "src": "/classify/(.*)",
+      "dest": "app.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "app.py"
+    }
+  ],
+  "env": {
+    "PYTHON_VERSION": "3.9"
+  },
+  "functions": {
+    "app.py": {
+      "maxDuration": 30,
+      "memory": 1024,
+      "runtime": "python3.9"
+    }
+  }
+}
