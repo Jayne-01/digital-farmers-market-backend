@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 
 // Get from environment variables
-const CLASSIFIER_URL = process.env.CLASSIFIER_URL || process.env.AI_SERVICE_URL || 'https://https://farm-classifier.onrender.com';
+const CLASSIFIER_URL = process.env.CLASSIFIER_URL || process.env.AI_SERVICE_URL || 'https://farm-classifier.onrender.com';
 const CLASSIFIER_TIMEOUT = parseInt(process.env.CLASSIFIER_TIMEOUT) || 90000;
 const MAX_RETRIES = parseInt(process.env.CLASSIFIER_MAX_RETRIES) || 5; // Increased to 5 retries
 const BASE_DELAY = parseInt(process.env.CLASSIFIER_BASE_DELAY) || 9000; // 3 seconds base delay
